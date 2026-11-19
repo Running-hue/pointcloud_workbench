@@ -1,0 +1,6 @@
+{
+  "source": "/Users/mugua-zhaojiangtao/Documents/my_file/数据/双目",
+  "segmentation": "/Users/mugua-zhaojiangtao/Documents/ChatGPT/科研/output试验区/双目分割_SAM2_RGB_20261119_123622",
+  "export_parent": "/Users/mugua-zhaojiangtao/Documents/ChatGPT/科研/output试验区",
+  "results": "/Users/mugua-zhaojiangtao/Documents/ChatGPT/科研/output试验区/点云双目成果_20261119_133926_276"
+}

@@ -1,0 +1,118 @@
+'use strict';
+// Exercise the shipped event handlers with an in-memory DOM and API transport.
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const app = path.resolve(__dirname, '..');
+const clone = value => JSON.parse(JSON.stringify(value));
+const frame = (id, extra = {}) => ({id, relative_dir:`pig_${id}/capture`, pig_id:id,
+  capture_id:'capture', reviewed:true, status:'reviewed', missing:[], has_cloud:false, ...extra});
+const dataset = {dataset_id:'one', source:'/raw', segmentation:'/masks', export_parent:'/out',
+  suggested_name:'new-result', frames:[frame('1'),frame('2', {reviewed:false,status:'draft'})],
+  results:'', pigs:2, reviewed:1, clouds:0, job:null};
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
+async function setup(initial = dataset) {
+  const elements = new Map();
+  function element() {
+    return {value:'', checked:false, disabled:false, hidden:false, textContent:'', children:[],
+      classList:{toggle() {}, add() {}}, parentElement:{}, listeners:{},
+      append(...items) { this.children.push(...items); }, replaceChildren() { this.children=[]; },
+      setAttribute() {}, removeAttribute() {}, scrollIntoView() {}, focus() {},
+      addEventListener(name, fn) { this.listeners[name] = fn; },
+      showModal() { this.open=true; }, close() { this.open=false; this.listeners.close?.(); }};
+  }
+  for (const match of fs.readFileSync(path.join(app,'index.html'),'utf8').matchAll(/id="([^"]+)"/g)) {
+    elements.set(match[1], element());
+  }
+  elements.get('filter').value='all';
+  const requests=[];
+  const sandbox = {APP_TOKEN:'test', URLSearchParams, Set, requestAnimationFrame:fn=>fn(),
+    setTimeout:()=>1, clearTimeout() {}, window:{addEventListener() {}},
+    document:{getElementById:id=>elements.get(id), createElement:element,
+      querySelectorAll:()=>[], querySelector:selector=>selector.includes('scope') ? {value:'selected'} : null},
+    fetch: async (url, options) => {
+      const payload = options?.body ? JSON.parse(options.body) : undefined;
+      requests.push({url,payload});
+      const data = sandbox.reply ? await sandbox.reply(url,payload) : clone(initial);
+      return {ok:true, status:200, json:async()=>data};
+    }};
+  const context=vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(app,'workbench.js'),'utf8'),context);
+  await settle();
+  return {elements, requests, sandbox, run:code=>vm.runInContext(code,context)};
+}
+
+test('reload with no selection offers reviewed captures and never includes drafts by default', async () => {
+  const ui=await setup({...dataset, job:{id:'failed', mode:'generate', status:'failed', done:2,
+    total:2,success:0,errors:[],skipped:[],error:'输入未对齐'}});
+  assert.equal(ui.elements.get('generate').disabled,false);
+  assert.match(ui.elements.get('generationHint').textContent,/已确认.*1 次/);
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['1']);
+  assert.equal(ui.elements.get('jobCurrent').textContent,'输入未对齐');
+});
+
+test('draft permission is explicit and the submitted scope follows the visible hint', async () => {
+  const ui=await setup();
+  ui.elements.get('draft').checked=true;
+  ui.elements.get('draft').onchange();
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['1','2']);
+  await ui.elements.get('generate').onclick();
+  assert.deepEqual(ui.requests.find(r=>r.url==='/api/generate').payload.ids,['1','2']);
+});
+
+test('selected ineligible frames stay blocked with a reason, eligible selection enables retry', async () => {
+  const ui=await setup();
+  ui.run("selected = new Set(['2']); controls();");
+  assert.equal(ui.elements.get('generate').disabled,true);
+  assert.match(ui.elements.get('generationHint').textContent,/分割确认状态/);
+  ui.run("selected = new Set(['1']); controls();");
+  assert.equal(ui.elements.get('generate').disabled,false);
+});
+
+test('finish validates paths, clears old failure and preserves selection for unchanged inputs', async () => {
+  const ui=await setup();
+  ui.run("selected.add('1'); state.job={status:'failed'};");
+  ui.sandbox.reply=async()=>clone({...dataset,dataset_id:'reloaded'});
+  ui.elements.get('name').value='用户选择的成果名';
+  ui.elements.get('directoryDialog').open=true;
+  await ui.elements.get('finishDirectories').onclick();
+  assert.equal(ui.elements.get('directoryDialog').open,false);
+  assert.equal(ui.elements.get('jobPanel').hidden,true);
+  assert.equal(ui.elements.get('generate').disabled,false);
+  assert.deepEqual(clone(ui.run('[...selected]')),['1']);
+  assert.equal(ui.elements.get('name').value,'用户选择的成果名');
+});
+
+test('changed paths require loading and clear prior selections only after validation succeeds', async () => {
+  const ui=await setup();
+  ui.run("selected.add('1');");
+  ui.elements.get('source').value='/new-raw';
+  ui.elements.get('source').listeners.input();
+  assert.equal(ui.elements.get('generate').disabled,true);
+  ui.sandbox.reply=async()=>{ throw new Error('目录不匹配'); };
+  ui.elements.get('directoryDialog').open=true;
+  await ui.elements.get('finishDirectories').onclick();
+  assert.equal(ui.elements.get('directoryDialog').open,true);
+  assert.match(ui.elements.get('directoryMessage').textContent,/目录不匹配/);
+  ui.sandbox.reply=async()=>clone({...dataset,source:'/new-raw',dataset_id:'two'});
+  await ui.elements.get('finishDirectories').onclick();
+  assert.deepEqual(clone(ui.run('[...selected]')),[]);
+  assert.equal(ui.elements.get('generate').disabled,false);
+});
+
+test('late job polling cannot restore an old failure after directory reload', async () => {
+  const ui=await setup();
+  ui.run("state.job={id:'old',status:'running'};");
+  let finish;
+  ui.sandbox.reply=()=>new Promise(resolve=>{finish=resolve;});
+  const poll=ui.run('poll()');
+  ui.run(`accept(${JSON.stringify({...dataset,dataset_id:'new'})},true)`);
+  finish({job:{id:'old',status:'failed'}});
+  await poll;
+  assert.equal(ui.run('state.job'),null);
+  assert.equal(ui.elements.get('jobPanel').hidden,true);
+  assert.equal(ui.elements.get('generate').disabled,false);
+});
