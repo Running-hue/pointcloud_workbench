@@ -18,6 +18,9 @@ import numpy as np
 from PIL import Image
 
 VERSION = 'metric-multimodal-v1'
+EXPORT_POLICY = 'segmentation-modality-v1'
+COMMON_RESULT_FILES = {'points.npz', 'pointcloud.json', 'preview.html',
+                       'mask_depth_check.png', 'rgb_projection_check.png'}
 IR_SOURCE_FILES = {'depth_sensor_code_u16.npy', 'infrared.npy', 'infrared.png',
                    'depth_mm.npy', 'reconstruction.json', 'color.png'}
 RGB_SOURCE_FILES = {'color.png', 'reconstruction.json', 'depth_aligned_to_color_mm.npy',
@@ -27,9 +30,41 @@ cv2.setNumThreads(1)
 
 def source_files(meta):
     names = set(RGB_SOURCE_FILES if meta.get('input_mode') == 'rgb' else IR_SOURCE_FILES)
-    if meta.get('input_mode') == 'rgb' and 'calibration.json' in meta.get('source_sha256', {}):
+    if 'calibration.json' in meta.get('source_sha256', {}) or 'calibration.json' in meta.get('geometry', {}).get('source_sha256', {}):
         names.add('calibration.json')
     return names
+
+
+def input_mode(report):
+    """Old IR reports omitted input_mode; never infer it from folder names."""
+    mode = report.get('input_mode')
+    if mode is None:
+        mode = 'rgb' if report.get('pixel_coordinate_space') == 'aligned_color' else 'infrared'
+    if mode not in {'infrared', 'rgb'}:
+        raise ValueError(f'未知分割输入模式：{mode}')
+    return mode
+
+
+def primary_ply(report):
+    return 'cloud_rgb_mm.ply' if input_mode(report) == 'rgb' else 'cloud_ir_mm.ply'
+
+
+def required_result_files(report):
+    return COMMON_RESULT_FILES | {primary_ply(report)}
+
+
+def camera_identity(record):
+    device = record.get('runtime', {}).get('device', {})
+    name = str(device.get('name', '未知相机'))
+    # Labels only: projection always uses this capture's profiles and extrinsics.
+    kind = 'stereo' if 'gemini 336' in name.lower() else ('itof' if 'femto bolt' in name.lower() else 'unknown')
+    return {'type': kind, 'model': name, 'serial_number': device.get('serial_number')}
+
+
+def export_metadata(report):
+    report = dict(report)
+    report.update(input_mode=input_mode(report), primary_ply=primary_ply(report), export_policy=EXPORT_POLICY)
+    return report
 
 
 def read_json(path):
@@ -234,7 +269,7 @@ def reconstruct(source, segmentation, allow_draft=False, max_rgb_delta_us=10000,
     if meta.get('input_mode') not in {None, 'infrared'}:
         raise ValueError('不支持的分割输入模式，请选择红外或经过几何核对的 RGB 分割成果')
     mask_path, mask, reviewed = choose_mask(segmentation, meta, allow_draft)
-    used = ['reconstruction.json', 'depth_sensor_code_u16.npy', 'infrared.npy', 'infrared.png', 'depth_mm.npy', 'color.png']
+    used = source_files(meta)
     hashes = {name: sha256(source/name) for name in used}
     mask_hash, meta_hash = sha256(mask_path), sha256(segmentation/'segmentation.json')
     for name, expected in meta.get('source_sha256', {}).items():
@@ -248,6 +283,11 @@ def reconstruct(source, segmentation, allow_draft=False, max_rgb_delta_us=10000,
     if ir.shape != codes.shape or mask.shape != codes.shape or not np.isfinite(ir).all():
         raise ValueError('红外、深度、掩码尺寸或数据非法')
     profile = verify_ir_depth(record, codes.shape)
+    if meta.get('geometry'):
+        from segmentation_workbench.geometry import prepare_frame
+        _, _, geometry, _ = prepare_frame(source, 'infrared')
+        if meta['geometry'].get('geometry_id') != geometry['geometry_id']:
+            raise ValueError('IR 分割的标定或深度来源已变化，请重新核对分割成果')
     scale = float(record['selected_capture']['streams']['depth']['value_scale_mm_per_code'])
     legacy = np.load(source/'depth_mm.npy', allow_pickle=False)
     expected_mm = np.clip(np.rint(codes.astype(float)*scale), 0, 65535).astype(np.uint16)
@@ -294,7 +334,7 @@ def reconstruct(source, segmentation, allow_draft=False, max_rgb_delta_us=10000,
     if fg[0].any() or fg[-1].any() or fg[:, 0].any() or fg[:, -1].any():
         warnings.append('掩码触及图像边界，检查出画／截断')
     payload = dict(xyz_mm=points, pixel_uv=vu[:, ::-1].astype(np.int32),
-                   depth_code=codes[selected], infrared_raw=ir[selected], rgb=rgb,
+                   depth_code=codes[selected], infrared_raw=ir[selected], infrared_valid=np.ones(len(points), bool), rgb=rgb,
                    rgb_valid=rgb_valid, rgb_uv=rgb_uv, depth_discontinuity=edges)
     report = {'version': VERSION, 'created_at': datetime.now(timezone.utc).isoformat(),
               'software': {'python': sys.version.split()[0], 'numpy': np.__version__, 'opencv': cv2.__version__},
@@ -302,6 +342,8 @@ def reconstruct(source, segmentation, allow_draft=False, max_rgb_delta_us=10000,
               'pig_id': meta.get('pig_id'), 'capture_id': meta.get('capture_id'),
               'reviewed': reviewed, 'segmentation_status': meta.get('status'),
               'segmentation_revision': meta.get('revision'), 'mask_file': mask_path.name,
+              'input_mode': 'infrared', 'camera': camera_identity(record), 'infrared_available': True,
+              'pixel_coordinate_space': 'depth_native', 'depth_value_frame': 'depth',
               'coordinate_system': 'native_depth_camera', 'unit': 'mm',
               'axes': {'X': 'right', 'Y': 'down', 'Z': 'forward (axial depth)'},
               'coordinate_operations': 'none; no centering, rotation, or rescaling',
@@ -317,7 +359,7 @@ def reconstruct(source, segmentation, allow_draft=False, max_rgb_delta_us=10000,
         raise ValueError('处理期间源数据发生变化，拒绝保存')
     if mask_hash != sha256(mask_path) or meta_hash != sha256(segmentation/'segmentation.json'):
         raise ValueError('处理期间分割发生变化，请重新生成')
-    return payload, report, mask
+    return payload, export_metadata(report), mask
 
 
 def ply_bytes(payload, colors):
@@ -351,12 +393,11 @@ def export_frame(destination, payload, report, mask):
     dest = Path(destination)
     dest.mkdir(parents=True, exist_ok=False)
     np.savez_compressed(dest/'points.npz', **payload)
-    ir_colors = display_ir(payload['infrared_raw'])
     rgb_colors = payload['rgb'].copy()
     rgb_colors[~payload['rgb_valid']] = [110, 120, 140]
-    (dest/'cloud_rgb_mm.ply').write_bytes(ply_bytes(payload, rgb_colors))
-    (dest/'cloud_ir_mm.ply').write_bytes(ply_bytes(payload, ir_colors))
-    write_json(dest/'pointcloud.json', report)
+    colors = rgb_colors if input_mode(report) == 'rgb' else display_ir(payload['infrared_raw'])
+    (dest/primary_ply(report)).write_bytes(ply_bytes(payload, colors))
+    write_json(dest/'pointcloud.json', export_metadata(report))
     if report.get('input_mode') == 'rgb':
         from segmentation_workbench.geometry import prepare_frame
         overlay, _, geometry, _ = prepare_frame(Path(report['source_dir']), 'rgb')

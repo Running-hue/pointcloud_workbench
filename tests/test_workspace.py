@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from http.server import ThreadingHTTPServer
 
 from pointcloud_workbench.tests import test_geometry
-from pointcloud_workbench.core import read_json, write_json, sha256, np, Image
+from pointcloud_workbench.core import read_json, write_json, sha256, np, Image, required_result_files
 from pointcloud_workbench.workspace import Workspace, RESULT_FILES
 from pointcloud_workbench.app import make_handler
 from pointcloud_workbench import native_picker
@@ -53,17 +53,21 @@ class WorkspaceTest(unittest.TestCase):
         row = self.ws.state()['frames'][0]
         self.assertFalse(row['missing'])
         generated = self.generate()
-        self.assertTrue(all((generated/self.rel/n).is_file() for n in RESULT_FILES))
+        report = read_json(generated/self.rel/'pointcloud.json')
+        self.assertTrue(all((generated/self.rel/n).is_file() for n in required_result_files(report)))
+        self.assertFalse((generated/self.rel/'cloud_rgb_mm.ply').exists())
         with np.load(generated/self.rel/'points.npz') as points:
             self.assertEqual(len(points['xyz_mm']), 34)
             np.testing.assert_array_equal(points['xyz_mm'][:,2], 1000)
         self.ws.start(self.payload(name='copied'), 'export'); self.ws.worker.join(10)
         self.assertEqual(self.ws.job['status'], 'completed', self.ws.job)
-        for name in RESULT_FILES:
+        for name in required_result_files(report):
             self.assertEqual(sha256(generated/self.rel/name), sha256(self.root/'copied'/self.rel/name))
         self.assertEqual(before, {str(p):sha256(p) for root in [self.source,self.seg] for p in root.rglob('*') if p.is_file()})
         manifest = read_json(self.root/'copied/pointcloud_dataset.json')
         self.assertEqual(manifest['frames'][0]['relative_dir'], self.rel)
+        self.assertTrue(manifest['frames'][0]['has_cloud'])
+        self.assertEqual(manifest['frames'][0]['primary_ply'],'cloud_ir_mm.ply')
         restored = Workspace(self.root/'settings')
         self.assertEqual(restored.state()['clouds'], 1)
         self.assertEqual(restored.source, self.source)
@@ -167,6 +171,27 @@ class WorkspaceTest(unittest.TestCase):
         (other/'pig_test').symlink_to(generated/'pig_test',target_is_directory=True)
         # pathlib does not descend directory symlinks; a root containing only links is not a dataset.
         with self.assertRaises(ValueError): self.ws.open_results(str(other))
+
+    def test_dataset_mode_cannot_silently_use_a_different_frame_mode(self):
+        dataset=read_json(self.seg/'dataset.json')
+        dataset['input_mode']='rgb'
+        write_json(self.seg/'dataset.json',dataset)
+        with self.assertRaisesRegex(ValueError,'输入模式不一致'):
+            self.ws.load({'source':str(self.source),'segmentation':str(self.seg)})
+
+    def test_open_other_segmentation_results_cannot_generate_from_current_inputs(self):
+        generated=self.generate()
+        report=read_json(generated/self.rel/'pointcloud.json')
+        report['segmentation_json_sha256']='other-camera-or-segmentation'
+        write_json(generated/self.rel/'pointcloud.json',report)
+        state=self.ws.open_results(str(generated))
+        self.assertFalse(state['results_match_inputs'])
+        with self.assertRaisesRegex(ValueError,'不是同一批输入'):
+            self.ws.start(self.payload('must-not-generate',allow_draft=True),'generate')
+        state=self.ws.load({'source':str(self.source),'segmentation':str(self.seg)})
+        self.assertTrue(state['results_match_inputs'])
+        self.assertEqual(state['clouds'],0)
+        self.assertEqual(state['results'],'')
 
     def test_http_preview_links_and_post_authentication(self):
         self.generate()

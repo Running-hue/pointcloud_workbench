@@ -12,7 +12,9 @@ import tempfile
 import threading
 from urllib.parse import quote
 
-from .core import independent_paths, within, read_json, write_json, sha256, reconstruct, export_frame, source_files
+from .core import (independent_paths, within, read_json, write_json, sha256, reconstruct,
+                   export_frame, source_files, input_mode, primary_ply, required_result_files,
+                   COMMON_RESULT_FILES, export_metadata, EXPORT_POLICY, camera_identity, np)
 from .viewer import write_viewer
 
 RESULT_FILES = {'points.npz', 'cloud_rgb_mm.ply', 'cloud_ir_mm.ply', 'pointcloud.json',
@@ -74,6 +76,7 @@ class Workspace:
         self.dataset_id = secrets.token_hex(12)
         self.rows = []
         self.results = {}
+        self.results_match_inputs = True
         self.source = self.segmentation = self.results_root = None
         self.last_output = None
         self.warning = ''
@@ -115,7 +118,11 @@ class Workspace:
                 row = merged.setdefault(rel, {'id': hashlib.sha256(rel.encode()).hexdigest()[:20],
                     'relative_dir': rel, 'pig_id': str(r.get('pig_id', '未知')), 'capture_id': r.get('capture_id', Path(rel).name),
                     'reviewed': r.get('reviewed', False), 'status': r.get('segmentation_status'), 'missing': []})
-                row.update(has_cloud=True, points=r['stats']['points'], cloud_reviewed=r.get('reviewed', False))
+                row.update(has_cloud=True, points=r['stats']['points'], cloud_reviewed=r.get('reviewed', False),
+                           cloud_input_mode=input_mode(r), cloud_ply=primary_ply(r),
+                           cloud_camera=r.get('camera', {}),
+                           infrared_available=r.get('infrared_available', True),
+                           has_ir_file=(result['folder']/'cloud_ir_mm.ply').is_file())
             frames = list(merged.values())
             for row in frames: row.setdefault('has_cloud', False)
             return {'dataset_id': self.dataset_id, 'source': str(self.source or ''),
@@ -124,6 +131,7 @@ class Workspace:
                     'frames': frames, 'pigs': len({r['pig_id'] for r in frames}),
                     'reviewed': sum(r.get('reviewed') is True for r in frames),
                     'clouds': len(self.results), 'native_picker': supported(),
+                    'results_match_inputs': self.results_match_inputs,
                     'export_parent': self.settings.get('export_parent', str(Path(__file__).resolve().parents[1]/'outputs')),
                     'suggested_name': '点云成果_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:19],
                     'job': copy.deepcopy(self.job), 'warning': self.warning}
@@ -146,6 +154,9 @@ class Workspace:
             if frame_id in ids: raise ValueError('采集编号重复')
             ids.add(frame_id)
             meta = read_json(m/'segmentation.json') if (m/'segmentation.json').is_file() else {}
+            mode = input_mode(meta)
+            if ds.get('input_mode') and mode != input_mode(ds):
+                raise ValueError(f'分割清单与逐帧输入模式不一致：{rel}')
             missing = [n for n in source_files(meta) if not (s/n).is_file()]
             if not meta: missing.append('segmentation.json')
             mask = 'trunk_mask.png' if meta.get('reviewed') is True and meta.get('status') == 'reviewed' else (
@@ -154,6 +165,7 @@ class Workspace:
             rows.append({'id': frame_id, 'relative_dir': rel, 'pig_id': str(entry['pig_id']),
                          'capture_id': entry['capture_id'], 'reviewed': meta.get('reviewed') is True,
                          'status': meta.get('status', 'missing'), 'decision': meta.get('decision', 'pending'),
+                         'input_mode': mode,
                          'missing': sorted(missing)})
         if all(r['missing'] for r in rows):
             example = rows[0]
@@ -167,12 +179,13 @@ class Workspace:
             # Keep failures visible until this succeeds; active jobs remain protected by idle().
             self.job = None
             self.stop_event.clear()
-            if changed:
+            if changed or not self.results_match_inputs:
                 self.results, self.results_root, self.last_output = {}, None, None
+            self.results_match_inputs = True
             self.warning = ''
             if remember:
                 self.settings.update(source=str(source), segmentation=str(seg))
-                if changed: self.settings.pop('results', None)
+                if not self.results_root: self.settings.pop('results', None)
                 self.remember()
             return self.state()
 
@@ -184,9 +197,11 @@ class Workspace:
             folder = within(root, rel)
             if p.is_symlink() or any((root/x).is_symlink() for x in p.relative_to(root).parents if str(x) != '.'):
                 raise ValueError('点云目录不能包含符号链接')
-            if not all((folder/n).is_file() and not (folder/n).is_symlink() for n in RESULT_FILES):
+            if not all((folder/n).is_file() and not (folder/n).is_symlink() for n in COMMON_RESULT_FILES):
                 continue
             report = read_json(p)
+            if not all((folder/n).is_file() and not (folder/n).is_symlink() for n in required_result_files(report)):
+                continue
             if report.get('coordinate_system') != 'native_depth_camera' or report.get('unit') != 'mm':
                 raise ValueError('该目录的点云不是当前毫米相机坐标格式')
             results[rel] = {'folder': folder, 'report': report}
@@ -194,6 +209,14 @@ class Workspace:
         with self.lock:
             self.idle()
             self.results, self.results_root = results, root
+            # Equal relative paths can occur in different cameras and segmentation
+            # jobs. Opening results must not authorize generation from other inputs.
+            self.results_match_inputs = bool(self.source and self.segmentation)
+            for rel, result in results.items():
+                meta_path = within(self.segmentation, rel)/'segmentation.json' if self.segmentation else None
+                if not meta_path or not meta_path.is_file() or sha256(meta_path) != result['report'].get('segmentation_json_sha256'):
+                    self.results_match_inputs = False
+                    break
             self.last_output = root
             self.job = None
             self.dataset_id = secrets.token_hex(12)
@@ -229,6 +252,8 @@ class Workspace:
             rows = [self.row(i) for i in ids]
             if mode == 'generate' and (not self.source or not self.segmentation):
                 raise ValueError('请先选择并载入原始目录与分割结果目录')
+            if mode == 'generate' and not self.results_match_inputs:
+                raise ValueError('当前成果与载入的分割不是同一批输入；请在目录设置中重新核对载入后生成')
             parent = directory(payload.get('parent'))
             target = parent/folder_name(payload.get('name'))
             protected = [p for p in [self.source, self.segmentation, self.state_dir, self.results_root] if p]
@@ -288,6 +313,22 @@ class Workspace:
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         safe_copy_tree(source['folder'], dest)
                         report = read_json(dest/'pointcloud.json')
+                        normalized = export_metadata(report)
+                        if not normalized.get('camera'):
+                            # Optional provenance upgrade; portable exports never require raw inputs.
+                            raw_record = Path(report.get('source_dir', ''))/'reconstruction.json'
+                            try:
+                                if report.get('source_sha256', {}).get('reconstruction.json') == sha256(raw_record):
+                                    normalized['camera'] = camera_identity(read_json(raw_record))
+                            except (OSError, ValueError, TypeError):
+                                pass
+                        other = 'cloud_ir_mm.ply' if input_mode(report) == 'rgb' else 'cloud_rgb_mm.ply'
+                        if (dest/other).exists(): (dest/other).unlink()
+                        if normalized != report:
+                            write_json(dest/'pointcloud.json', normalized)
+                            with np.load(dest/'points.npz', allow_pickle=False) as data:
+                                write_viewer(dest/'preview.html', data, normalized)
+                        report = normalized
                     completed.append((row, report))
                     with self.lock: self.job['success'] += 1
                 except SkipCapture as exc:
@@ -306,7 +347,10 @@ class Workspace:
             status = 'stopped' if self.stop_event.is_set() else ('completed_with_errors' if self.job['errors'] else 'completed')
             manifest = {'schema_version': 1, 'source': str(self.source or ''), 'segmentation': str(self.segmentation or ''),
                         'output': str(target), 'coordinate_system': 'native_depth_camera', 'unit': 'mm',
-                        'frames': [{**row, 'reviewed': report['reviewed'], 'points': report['stats']['points']} for row, report in completed]}
+                        'export_policy': EXPORT_POLICY,
+                        'frames': [{**row, 'has_cloud': True, 'input_mode': input_mode(report),
+                                    'primary_ply': primary_ply(report), 'camera': report.get('camera', {}),
+                                    'reviewed': report['reviewed'], 'points': report['stats']['points']} for row, report in completed]}
             write_json(stage/'pointcloud_dataset.json', manifest)
             final_job = {**copy.deepcopy(self.job), 'status': status, 'current': '已按原相对目录保存全部成果'}
             write_json(stage/'export.json', final_job)
@@ -318,6 +362,7 @@ class Workspace:
             with self.lock:
                 self.last_output = target
                 if mode == 'generate':
+                    self.results_match_inputs = True
                     self.results_root = target
                     self.results = {row['relative_dir']: {'folder': within(target, row['relative_dir']), 'report': report} for row, report in completed}
                     self.settings['results'] = str(target)

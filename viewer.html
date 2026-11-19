@@ -15,14 +15,15 @@
 <aside aria-label="点云信息"><section class="cloudsummary"><div id="identity"></div><div class="asidehead"><h2>当前点云</h2><span class="tag" id="status"></span></div><div class="countline"><div class="value" id="count"></div><small>可见表面</small></div><div class="metrics"><span><em>深度有效率</em><b id="depthRatio"></b></span><span><em>RGB 可用率</em><b id="rgbRatio"></b></span></div></section>
 <section><h2>相机坐标范围 / mm</h2><table><thead><tr><th>轴</th><th>最小</th><th>最大</th><th>跨度</th></tr></thead><tbody id="bounds"></tbody></table><div id="axis">X 向右 · Y 向下 · Z 向前<br>轴向跨度不等于解剖体尺。</div></section>
 <section class="checks"><h2>辅助检查</h2><div class="checkgrid"><a class="checkimage" href="mask_depth_check.png" aria-label="掩码与有效深度检查图"><img src="mask_depth_check.png" alt="掩码与深度"><span>掩码与深度 ↗</span></a><a class="checkimage" href="rgb_projection_check.png" aria-label="RGB 投影检查图"><img src="rgb_projection_check.png" alt="RGB 投影"><span>RGB 投影 ↗</span></a></div></section>
-<div class="asidefoot"><p id="shortNote"></p><button id="showNotes">查看数据说明</button><a href="pointcloud.json">查看生成记录 ↗</a><div id="fileLinks"><p>完整点云文件</p><a href="cloud_rgb_mm.ply">RGB PLY</a> · <a href="cloud_ir_mm.ply">IR PLY</a> · <a href="points.npz">NPZ</a></div></div></aside></main>
+<div class="asidefoot"><p id="shortNote"></p><button id="showNotes">查看数据说明</button><a href="pointcloud.json">查看生成记录 ↗</a><div id="fileLinks"><p>完整点云文件</p><a id="plyFileLink" href="__PRIMARY_PLY__">__PLY_LABEL__</a> · <a href="points.npz">NPZ</a></div></div></aside></main>
 <dialog id="notesDialog"><div class="modalhead"><h2>复核提醒与数据说明</h2><button id="closeNotes" aria-label="关闭数据说明">×</button></div><div id="warn"></div><div class="sourcepaths"><p id="sourcePath"></p><p id="maskPath"></p><p>坐标原点：原始深度相机；单位：毫米。可见表面不补全遮挡部分，实际测量精度仍需用已知尺寸实物验证。</p></div></dialog>
 <script>
 const DATA=__POINT_DATA__;
 const r=DATA.report,s=r.stats,$=id=>document.getElementById(id),canvas=$('cloud'),ctx=canvas.getContext('2d');
 $('status').textContent=r.reviewed?'分割已确认':'初稿预览';$('status').classList.toggle('good',r.reviewed);
-if(r.infrared_available===false){const option=document.querySelector('#mode option[value="ir"]');option.disabled=true;option.textContent='红外未关联';document.querySelector('#fileLinks a[href="cloud_ir_mm.ply"]').hidden=true;}
-$('identity').textContent='耳标 '+r.pig_id+' / '+r.capture_id;
+if(r.infrared_available===false){const option=document.querySelector('#mode option[value="ir"]');option.disabled=true;option.textContent='红外未关联';}
+$('mode').value=r.input_mode==='infrared'?'ir':'rgb';
+$('identity').textContent=[r.camera?.model,r.input_mode==='infrared'?'IR 分割':'RGB 分割','耳标 '+r.pig_id+' / '+r.capture_id].filter(Boolean).join(' · ');
 $('count').textContent=s.points.toLocaleString()+' 点';
 $('depthRatio').textContent=(100*s.valid_depth_ratio).toFixed(2)+'%';$('rgbRatio').textContent=(100*s.rgb_valid_ratio).toFixed(2)+'%';
 $('shortNote').textContent=r.reviewed?'单视角可见表面；实际体尺需测量验证。':'未审核分割初稿，仅供流程预览。';

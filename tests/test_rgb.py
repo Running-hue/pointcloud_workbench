@@ -99,6 +99,8 @@ class RGBCloudTest(unittest.TestCase):
         payload,report,mask=reconstruct(self.source,self.seg,True)
         dest=export_frame(self.root/'result',payload,report,mask)
         write_viewer(dest/'preview.html',payload,report)
+        self.assertTrue((dest/'cloud_rgb_mm.ply').is_file())
+        self.assertFalse((dest/'cloud_ir_mm.ply').exists())
         with Image.open(dest/'mask_depth_check.png') as image:
             self.assertEqual(image.size,(7,5))
         with Image.open(dest/'rgb_projection_check.png') as image:
@@ -126,6 +128,44 @@ class RGBCloudTest(unittest.TestCase):
         self.assertEqual(ws.job['status'],'completed',ws.job)
         self.assertEqual(ws.state()['clouds'],1)
         self.assertEqual(Workspace(self.root/'settings').state()['clouds'],1)
+        self.assertFalse((self.root/'workspace-result'/rel/'cloud_ir_mm.ply').exists())
+        self.assertFalse(ws.state()['frames'][0]['has_ir_file'])
+        # RGB folders from the previous version remain readable, with the old
+        # placeholder identified in the export plan rather than as measured IR.
+        (self.root/'workspace-result'/rel/'cloud_ir_mm.ply').write_bytes(b'legacy placeholder')
+        state = ws.open_results(str(self.root/'workspace-result'))
+        self.assertEqual(state['clouds'],1)
+        self.assertTrue(state['frames'][0]['has_ir_file'])
+        self.assertFalse(state['frames'][0]['infrared_available'])
+
+    def test_http_rgb_preview_executes_and_rewrites_only_markup(self):
+        import json
+        import subprocess
+        import threading
+        from http.server import ThreadingHTTPServer
+        from urllib.parse import urlencode
+        from urllib.request import urlopen
+        from pointcloud_workbench.app import make_handler
+        from pointcloud_workbench.viewer import render_viewer
+        payload, report, mask = reconstruct(self.source,self.seg,True)
+        dest=export_frame(self.root/'result'/'pig_rgb'/'capture',payload,report,mask)
+        write_viewer(dest/'preview.html',payload,report)
+        ws=Workspace(self.root/'http-settings')
+        state=ws.open_results(str(self.root/'result'))
+        server=ThreadingHTTPServer(('127.0.0.1',0),make_handler(ws,'test-token'))
+        thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+        try:
+            query=urlencode({'dataset_id':state['dataset_id'],'id':state['frames'][0]['id'],'file':'preview.html'})
+            page=urlopen(f'http://127.0.0.1:{server.server_port}/api/media?'+query).read().decode()
+            expected=render_viewer(payload,report,embedded=True)
+            self.assertEqual(page.partition('<script>')[2],expected.partition('<script>')[2])
+            self.assertIn('src="/api/media?',page.partition('<script>')[0])
+            result=subprocess.run(['node',str(Path(__file__).with_name('viewer_runtime.cjs'))],
+                                  input=page,text=True,capture_output=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertGreater(json.loads(result.stdout)['draws'],34)
+        finally:
+            server.shutdown(); server.server_close(); thread.join(2)
 
 
 if __name__=='__main__': unittest.main()

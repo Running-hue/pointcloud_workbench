@@ -30,6 +30,7 @@ async function action(fn) {
 function accept(data, paths = false) {
   const first = !state;
   const changedInputs = state && (data.source !== state.source || data.segmentation !== state.segmentation);
+  const changedResults = state && data.results !== state.results;
   const previousCurrent = current;
   state = data;
   clearTimeout(pollTimer);
@@ -42,7 +43,8 @@ function accept(data, paths = false) {
     selected = new Set(state.frames.filter(r => r.has_cloud).map(r => r.id));
   }
   selected = new Set([...selected].filter(id => state.frames.some(r => r.id === id)));
-  if (!state.frames.some(r => r.id === current)) current = (state.frames.find(r => r.has_cloud) || state.frames[0])?.id;
+  if (!state.frames.some(r => r.id === current) || changedResults && !state.frames.find(r => r.id === current)?.has_cloud)
+    current = (state.frames.find(r => r.has_cloud) || state.frames[0])?.id;
   render();
   if (first || paths || previousCurrent !== current) document.querySelector('.frame.active')?.scrollIntoView({block:'nearest'});
   if (state.warning) message(state.warning, true);
@@ -66,7 +68,9 @@ function renderList() {
     const title = document.createElement('strong'); title.textContent = '耳标 ' + row.pig_id;
     const capture = document.createElement('span'); capture.className = 'capture'; capture.textContent = row.capture_id;
     const chips = document.createElement('span'); chips.className = 'chips';
-    chips.textContent = [row.has_cloud ? `${row.points.toLocaleString()} 点` : '未生成',
+    const mode = row.has_cloud ? row.cloud_input_mode : row.input_mode;
+    chips.textContent = [mode === 'rgb' ? 'RGB 分割' : mode === 'infrared' ? 'IR 分割' : '',
+      row.has_cloud ? `${row.points.toLocaleString()} 点` : '未生成',
       row.reviewed ? '分割已确认' : '分割待确认', row.decision === 'reject' ? '已淘汰' : '',
       row.missing.length ? '缺失 ' + row.missing.length + ' 项' : ''].filter(Boolean).join(' · ');
     if (row.missing.length || row.decision === 'reject') chips.classList.add('warn');
@@ -84,7 +88,10 @@ function media(row, file) {
 }
 function renderViewer() {
   const row = state.frames.find(r => r.id === current);
-  $('currentTitle').textContent = row ? `${row.pig_id} / ${row.capture_id}` : '选择一次采集查看点云';
+  const camera = {stereo:'双目',itof:'iToF'}[row?.cloud_camera?.type];
+  const mode = row?.cloud_input_mode || row?.input_mode;
+  $('currentTitle').textContent = row ? [camera,mode === 'rgb' ? 'RGB 分割' : mode === 'infrared' ? 'IR 分割' : '',
+    `${row.pig_id} / ${row.capture_id}`].filter(Boolean).join(' · ') : '选择一次采集查看点云';
   $('currentTag').hidden = !row?.has_cloud;
   if (row?.has_cloud) {
     $('currentTag').textContent = row.cloud_reviewed ? '已确认分割' : '初稿预览';
@@ -144,6 +151,7 @@ function destination() {
 function render() { renderList(); renderViewer(); renderJob(); controls(); }
 function generationPlan() {
   if (!state?.source || !state?.segmentation) return {error:'请打开“目录设置”，选择原始采集目录与分割目录并载入。'};
+  if (state.results_match_inputs === false) return {error:'当前成果与载入的分割不是同一批输入；请在目录设置中重新核对载入后生成。'};
   if (dirty()) return {error:'输入目录已更改，请打开“目录设置”并点击“完成并载入”。'};
   const rows = state.frames.filter(r => !selected.size || selected.has(r.id));
   const usable = rows.filter(r => !r.missing.length && r.decision !== 'reject' &&
@@ -232,7 +240,9 @@ function exportRows() {
 function exportPlan() {
   const rows = exportRows(); $('exportPath').textContent = destination();
   $('exportCount').textContent = `${rows.length} 次采集 · 每次采集完整文件夹`;
-  $('exportTree').textContent = rows.slice(0, 4).map(r => r.relative_dir + '/\n  cloud_rgb_mm.ply · cloud_ir_mm.ply · points.npz\n  pointcloud.json · 两张检查图 · preview.html').join('\n') +
+  $('exportTree').textContent = rows.slice(0, 4).map(r => r.relative_dir + '/\n  ' +
+    (r.cloud_ply || (r.cloud_input_mode === 'rgb' ? 'cloud_rgb_mm.ply' : 'cloud_ir_mm.ply')) + ' · ' +
+    'points.npz\n  pointcloud.json · 两张检查图 · preview.html').join('\n') +
     (rows.length > 4 ? `\n…另 ${rows.length - 4} 次采集` : '') + '\n根目录另含：index.html · pointcloud_dataset.json · export.json';
   $('confirmExport').disabled = !rows.length || busy || running();
 }

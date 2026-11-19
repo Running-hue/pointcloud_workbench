@@ -1,6 +1,6 @@
 # 多模态毫米点云生成
 
-把已有 iToF 红外分割、原始深度码、逐帧标定和 RGB 联合整理成**以原始深度相机为原点、单位毫米的可见表面点云**。点的坐标保持实际尺度，不居中、不对每头猪归一化。每次采集独立输出。
+支持双目（Gemini 336L）和 iToF（Femto Bolt）相机，各自可读取 IR 或 RGB 分割，生成**以原始深度相机为原点、单位毫米的可见表面点云**。点的坐标保持实际尺度，不居中、不对每头猪归一化。每次采集独立输出。
 
 这里的“生成”是有标定约束的测量重建，没有新增或训练生成模型，没有补全遮挡身体。当前接入的分割数据集是 `outputs/itof_SAM2猪体分割`；不合并不同时间、不同姿态或不同相机的数据。
 
@@ -69,6 +69,22 @@ python3 pointcloud_workbench/batch.py \
 
 ## 模态与坐标
 
+相机类型与分割输入是两个独立维度：相机型号从逐帧 `reconstruction.json` 的设备记录读取，
+不根据目录名称判断；几何计算使用该帧的实际 profile、深度比例和外参。
+
+|相机|分割输入|主 PLY 文件|默认预览配色|
+|---|---|---|---|
+|双目|IR|`cloud_ir_mm.ply`|红外强度|
+|双目|RGB|`cloud_rgb_mm.ply`|RGB|
+|iToF|IR|`cloud_ir_mm.ply`|红外强度|
+|iToF|RGB|`cloud_rgb_mm.ply`|RGB|
+
+每次采集只导出与分割输入一致的一种 PLY。IR 路径可在 NPZ 内保留已配准的 RGB 属性用于复核，
+预览中切换配色不会生成另一个 PLY，也不改变点坐标。
+`pointcloud.json` 记录 `input_mode`、`camera`、`primary_ply` 和 `export_policy`。
+旧成果缺少 `input_mode` 的 IR 记录仍可加载；重新导出旧成果时在新目录中只保留主 PLY，
+更新预览和导出清单，原成果不变。
+
 ### RGB 分割输入（含 Gemini 336L 双目）
 
 工作台也支持当前分割工作台生成的 `input_mode=rgb`、`rgb-aligned-depth-v1` 成果。
@@ -86,8 +102,9 @@ RGB 图会按分割时相同的规则映射到保存的对齐深度网格，配�
 初稿预览只允许未审核掩码，不会绕过文件、标定、深度单位或几何一致性检查。
 
 本 RGB 路径尚未关联原始红外强度，因此 NPZ 的 `infrared_raw` 为 NaN、
-`infrared_valid` 为 false；预览禁用红外配色。为兼容完整文件夹导出，仍保存灰色占位的
-`cloud_ir_mm.ply`，其灰色不能解释为测得的红外值。RGB PLY 和 NPZ 保存完整有效几何。
+`infrared_valid` 为 false；预览禁用红外配色，也不生成 `cloud_ir_mm.ply`。
+旧版 RGB 成果可能包含灰色占位的 `cloud_ir_mm.ply`，工作台仍可加载，灰色不能解释为测得的红外值。
+RGB PLY 和 NPZ 保存完整有效几何。
 
 以下表格介绍原生红外分割路径：
 
@@ -117,8 +134,9 @@ RGB 与深度默认允许的设备时间戳绝对差为 10000 μs，超过时保
 ├── pointcloud_dataset.json       # 浏览器生成/导出的采集清单
 ├── export.json                   # 浏览器任务结果；CLI 使用 summary.json
 └── pig_编号/采集时间/
-    ├── cloud_rgb_mm.ply           # 全密度 XYZ + RGB；缺失配色显示灰色
-    ├── cloud_ir_mm.ply            # 同一份 XYZ，以 IR 强度配色
+    ├── cloud_rgb_mm.ply           # RGB 分割时生成；全密度 XYZ + RGB
+    │                             # 每次采集的 PLY 为二者之一
+    ├── cloud_ir_mm.ply            # IR 分割时生成；全密度 XYZ + 红外强度配色
     ├── points.npz                # 完整点属性，无 pickle
     ├── pointcloud.json            # 坐标、单位、标定、来源校验值、质量记录
     ├── mask_depth_check.png       # 绿色为掩码，红色为无有效点的掩码像素
@@ -126,7 +144,7 @@ RGB 与深度默认允许的设备时间戳绝对差为 10000 μs，超过时保
     └── preview.html              # 离线交互预览，不需要外部网络
 ```
 
-NPZ 数组按行一一对应：`xyz_mm[N,3]`、`pixel_uv[N,2]`（u 列、v 行）、`depth_code[N]`、`infrared_raw[N]`、`rgb[N,3]`、`rgb_valid[N]`、`rgb_uv[N,2]`、`depth_discontinuity[N]`。其中 `rgb_uv` 越界／缺失可以是 NaN，应结合 `rgb_valid` 使用。
+NPZ 数组按行一一对应：`xyz_mm[N,3]`、`pixel_uv[N,2]`（u 列、v 行）、`depth_code[N]`、`infrared_raw[N]`、`infrared_valid[N]`、`rgb[N,3]`、`rgb_valid[N]`、`rgb_uv[N,2]`、`depth_discontinuity[N]`。旧版 IR NPZ 未单列 `infrared_valid`；新生成的 IR 数据为 true，未关联 IR 的 RGB 数据为 false。其中 `rgb_uv` 越界／缺失可以是 NaN，应结合 `rgb_valid` 使用。
 
 PLY 为二进制 little-endian，坐标是 float32 毫米，还保存 u/v、IR 值及 RGB 有效标记。很多查看软件只显示 XYZ/RGB，需要在软件中按毫米解释尺度；用 NPZ 可保留全部属性。
 

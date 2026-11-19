@@ -80,10 +80,14 @@ def make_handler(workspace, token):
                     if p.suffix == '.html':
                         with np.load(arrays, allow_pickle=False) as saved:
                             page = render_viewer(saved, report, embedded=True)
+                        # Rewrite HTML attributes only. The script may contain selectors or
+                        # recorded strings with the same text, which must remain untouched.
+                        markup, separator, script = page.partition('<script>')
                         for name in RESULT_FILES:
                             route = '/api/media?' + urlencode({'dataset_id': q['dataset_id'][0], 'id': q['id'][0], 'file': name})
-                            page = page.replace(f'href="{name}"', f'href="{route}" target="_blank"')
-                            page = page.replace(f'src="{name}"', f'src="{route}"')
+                            markup = markup.replace(f'href="{name}"', f'href="{route}" target="_blank"')
+                            markup = markup.replace(f'src="{name}"', f'src="{route}"')
+                        page = markup + separator + script
                         self.send(page.encode('utf-8'), 'text/html; charset=utf-8')
                     else: self.send(data, mimetypes.guess_type(p.name)[0] or 'application/octet-stream')
                 elif url.path == '/favicon.ico': self.send(b'', 'image/x-icon', 204)

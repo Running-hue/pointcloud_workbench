@@ -112,7 +112,10 @@ class WorkflowTest(unittest.TestCase):
         dest = export_frame(self.root/'output', payload, report, mask)
         with np.load(dest/'points.npz') as saved:
             np.testing.assert_array_equal(saved['xyz_mm'],payload['xyz_mm'])
-        raw = (dest/'cloud_rgb_mm.ply').read_bytes()
+        self.assertFalse((dest/'cloud_rgb_mm.ply').exists())
+        self.assertEqual(report['input_mode'], 'infrared')
+        self.assertTrue(payload['infrared_valid'].all())
+        raw = (dest/'cloud_ir_mm.ply').read_bytes()
         header, body = raw.split(b'end_header\n')
         self.assertIn(b'unit mm', header)
         self.assertIn(b'element vertex 34', header)

@@ -116,3 +116,29 @@ test('late job polling cannot restore an old failure after directory reload', as
   assert.equal(ui.elements.get('jobPanel').hidden,true);
   assert.equal(ui.elements.get('generate').disabled,false);
 });
+
+test('export plan lists only the segmentation modality for IR and RGB captures', async () => {
+  for (const [mode, ply, other] of [['infrared','cloud_ir_mm.ply','cloud_rgb_mm.ply'],['rgb','cloud_rgb_mm.ply','cloud_ir_mm.ply']]) {
+    const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{
+      has_cloud:true,points:100,cloud_input_mode:mode,cloud_ply:ply,has_ir_file:true})]});
+    ui.run('exportPlan()');
+    assert.ok(ui.elements.get('exportTree').textContent.includes(ply));
+    assert.ok(!ui.elements.get('exportTree').textContent.includes(other));
+  }
+});
+
+test('opening results selects a generated capture when current input has no cloud', async () => {
+  const ui=await setup();
+  assert.equal(ui.run('current'),'1');
+  const data={...dataset,clouds:1,results:'/other-results',frames:[frame('1'),frame('2',{
+    has_cloud:true,points:100,cloud_input_mode:'infrared',cloud_ply:'cloud_ir_mm.ply'})]};
+  ui.run(`accept(${JSON.stringify(data)})`);
+  assert.equal(ui.run('current'),'2');
+  assert.equal(ui.elements.get('viewer').hidden,false);
+});
+
+test('results from another segmentation can be viewed but require reloading inputs before generation', async () => {
+  const ui=await setup({...dataset,results_match_inputs:false});
+  assert.equal(ui.elements.get('generate').disabled,true);
+  assert.match(ui.elements.get('generationHint').textContent,/不是同一批输入/);
+});

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import sys
 
 from .core import (VERSION, Image, np, cv2, source_files, sha256, choose_mask, read_json,
-                   backproject, project, discontinuities)
+                   backproject, project, discontinuities, camera_identity, export_metadata)
 from segmentation_workbench.geometry import prepare_frame, validate_mask_region, RGB_VERSION
 
 
@@ -72,7 +72,7 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
     warnings = ['单视角可见表面；未补全遮挡面或腹面；轴向跨度不等同于解剖体尺',
                 '使用已保存的 RGB 对齐深度，采样密度由对齐网格决定，不代表独立深度测量数量',
                 '毫米尺度来自记录的标定，实际尺寸误差仍需实物验证',
-                '本路径未关联原始红外强度；IR 属性为缺失值，IR PLY 仅用灰色占位']
+                '本路径未关联原始红外强度；IR 属性为缺失值，不生成 IR PLY']
     if not reviewed: warnings.insert(0, '未审核分割初稿，仅供流程预览，不作为合格躯干测量或训练样本')
     if abs(dt) > max_rgb_delta_us: warnings.append('RGB 与深度不同步，保留几何但不使用 RGB 配色')
     if orthogonality > .001: warnings.append('记录的相机旋转矩阵轻微非正交，使用原矩阵求逆并记录误差')
@@ -88,7 +88,7 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
               'pig_id':meta.get('pig_id'), 'capture_id':meta.get('capture_id'),
               'reviewed':reviewed, 'segmentation_status':meta.get('status'),
               'segmentation_revision':meta.get('revision'), 'mask_file':mask_path.name,
-              'input_mode':'rgb', 'geometry_id':geometry['geometry_id'],
+              'input_mode':'rgb', 'camera':camera_identity(record), 'geometry_id':geometry['geometry_id'],
               'pixel_coordinate_space':'aligned_color', 'depth_value_frame':'color',
               'coordinate_system':'native_depth_camera', 'unit':'mm',
               'axes':{'X':'right','Y':'down','Z':'forward (axial depth)'},
@@ -119,4 +119,4 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
         raise ValueError('处理期间 RGB 源数据发生变化，拒绝保存')
     if mask_hash != sha256(mask_path) or meta_hash != sha256(segmentation/'segmentation.json'):
         raise ValueError('处理期间 RGB 分割发生变化，请重新生成')
-    return payload, report, mask
+    return payload, export_metadata(report), mask

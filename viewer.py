@@ -3,10 +3,11 @@ import json
 from pathlib import Path
 
 import numpy as np
-from .core import display_ir
+from .core import display_ir, export_metadata
 
 
 def render_viewer(payload, report, embedded=False):
+    report = export_metadata(report)
     # Uniform reproducible display sampling; never modifies exported point sets.
     n = len(payload['xyz_mm'])
     # Seeded uniform sampling avoids stripes caused by a fixed raster stride.
@@ -18,7 +19,10 @@ def render_viewer(payload, report, embedded=False):
             'valid': payload['rgb_valid'][idx].astype(int).tolist(), 'report': report}
     template = Path(__file__).with_name('viewer.html').read_text(encoding='utf-8')
     encoded = json.dumps(data, ensure_ascii=False, separators=(',', ':'), allow_nan=False).replace('<', '\\u003c')
-    return template.replace('__POINT_DATA__', encoded).replace('__BODY_CLASS__', 'embedded' if embedded else '')
+    return (template.replace('__POINT_DATA__', encoded)
+            .replace('__BODY_CLASS__', 'embedded' if embedded else '')
+            .replace('__PRIMARY_PLY__', report['primary_ply'])
+            .replace('__PLY_LABEL__', 'IR PLY' if report['input_mode'] == 'infrared' else 'RGB PLY'))
 
 
 def write_viewer(path, payload, report):

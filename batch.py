@@ -10,7 +10,8 @@ import tempfile
 if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pointcloud_workbench.core import (independent_paths, within, read_json, write_json,
-                                       reconstruct, export_frame, sha256, VERSION, cv2)
+                                       reconstruct, export_frame, sha256, VERSION, cv2,
+                                       required_result_files, EXPORT_POLICY)
 from pointcloud_workbench.viewer import write_viewer
 
 
@@ -53,6 +54,9 @@ def run(args):
         s, m, dest = within(source, relative), within(seg, relative), within(output, relative)
         try:
             meta = read_json(m/'segmentation.json')
+            if meta.get('decision') == 'reject':
+                summary['skipped'].append({'relative_dir': relative, 'reason': 'segmentation_rejected'})
+                continue
             if not args.allow_draft and not (meta.get('reviewed') is True and meta.get('status') == 'reviewed'):
                 summary['skipped'].append({'relative_dir': relative, 'reason': 'segmentation_not_reviewed'})
                 continue
@@ -62,11 +66,12 @@ def run(args):
                 mask_path = m/report['mask_file']
                 fresh = report['segmentation_json_sha256'] == sha256(m/'segmentation.json')
                 fresh &= report['version'] == VERSION
+                fresh &= report.get('export_policy') == EXPORT_POLICY
                 fresh &= report['mask_sha256'] == sha256(mask_path)
                 fresh &= all(sha256(s/name) == digest for name, digest in report['source_sha256'].items())
                 fresh &= report['rgb']['max_absolute_delta_us'] == args.max_rgb_delta_us
                 fresh &= report['rgb'].get('visibility_tolerance_mm', args.visibility_mm) == args.visibility_mm
-                fresh &= all((dest/n).is_file() for n in ['points.npz', 'cloud_rgb_mm.ply', 'cloud_ir_mm.ply', 'preview.html'])
+                fresh &= all((dest/n).is_file() for n in required_result_files(report))
                 if not fresh:
                     raise ValueError('已有点云与当前输入或参数不一致，请使用新的输出目录')
                 summary['existing'].append(relative)
