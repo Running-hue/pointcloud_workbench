@@ -1,6 +1,7 @@
 """Native folder dialogs in a helper process, never a browser file upload."""
 from pathlib import Path
 import json
+import queue
 import subprocess
 import sys
 import threading
@@ -30,23 +31,66 @@ def supported():
     return sys.platform in {'darwin', 'win32'}
 
 
+def initial_directory(value=None):
+    """Ignore paths copied from another OS instead of starting at a drive root."""
+    from pathlib import PurePosixPath, PureWindowsPath
+    value = value.strip() if isinstance(value, str) else ''
+    initial = Path(value).expanduser() if value else Path.home()
+    if not initial.is_absolute() and (PurePosixPath(value or '').is_absolute() or
+                                      PureWindowsPath(value or '').is_absolute()):
+        initial = Path.home()
+    while not initial.is_dir() and initial != initial.parent:
+        initial = initial.parent
+    return initial.resolve()
+
+
+def run_windows_picker(command):
+    """Bound initialization separately from the time spent choosing a folder."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, encoding='utf-8', creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    ready = queue.Queue()
+    def read_ready():
+        try:
+            ready.put(process.stdout.readline())
+        except (OSError, ValueError):
+            ready.put('')
+    reader = threading.Thread(target=read_ready, daemon=True)
+    reader.start()
+    try:
+        try:
+            line = ready.get(timeout=15)
+        except queue.Empty as exc:
+            raise ValueError('系统目录窗口启动超时。请关闭工作台服务，在本机双击“启动点云工作台.bat”重新启动；也可直接填写目录。') from exc
+        if line.strip() != '{"ready": true}':
+            _, error = process.communicate(timeout=5)
+            raise ValueError('系统文件夹窗口未能打开：' + error.strip()[:500])
+        output, error = process.communicate(timeout=600)
+        return subprocess.CompletedProcess(command, process.returncode, output, error)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        reader.join(timeout=1)
+        process.communicate()
+
+
 def choose_directory(value=None, title='选择文件夹'):
     if not supported():
         raise ValueError('当前原生目录选择支持 macOS 和 Windows；其他系统可直接填写路径')
     if not PICKER_LOCK.acquire(blocking=False):
         raise ValueError('已有文件夹选择窗口，请先选择或取消')
     try:
-        initial = Path(value).expanduser() if isinstance(value, str) and value.strip() else Path.home()
-        while not initial.is_dir() and initial != initial.parent:
-            initial = initial.parent
+        initial = initial_directory(value)
         if sys.platform == 'darwin':
             command = ['/usr/bin/osascript', '-l', 'JavaScript', '-e', MAC_SCRIPT,
                        str(title)[:200], str(initial.resolve())]
         else:
             command = [sys.executable, str(Path(__file__).resolve()), '--windows-helper',
                        str(title)[:200], str(initial.resolve())]
-        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
-                                timeout=600, check=False)
+        if sys.platform == 'win32':
+            result = run_windows_picker(command)
+        else:
+            result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
+                                    timeout=600, check=False)
         if result.returncode:
             raise ValueError('系统文件夹窗口未能打开：'+result.stderr.strip()[:500])
         selected = result.stdout.rstrip('\r\n') if sys.platform == 'darwin' else json.loads(result.stdout)['path']
@@ -62,65 +106,76 @@ def choose_directory(value=None, title='选择文件夹'):
         PICKER_LOCK.release()
 
 
-def windows_folder(title, initial):
-    """Windows Common Item Dialog (IFileOpenDialog + FOS_PICKFOLDERS)."""
+def windows_folder(title, initial, on_ready=None):
+    """Open the Windows shell folder picker on the helper's main GUI thread."""
     import ctypes as c
-    import uuid
     from ctypes import wintypes as w
 
-    class GUID(c.Structure):
-        _fields_ = [('data', c.c_ubyte*16)]
-        @classmethod
-        def parse(cls, value):
-            return cls((c.c_ubyte*16).from_buffer_copy(uuid.UUID(value).bytes_le))
+    shell = c.WinDLL('shell32', use_last_error=True)
+    ole = c.WinDLL('ole32', use_last_error=True)
+    user = c.WinDLL('user32', use_last_error=True)
+    callback_type = c.WINFUNCTYPE(c.c_int, w.HWND, w.UINT, w.LPARAM, w.LPARAM)
 
-    ole, shell = c.WinDLL('ole32'), c.WinDLL('shell32')
-    hr = c.c_long
+    class BROWSEINFO(c.Structure):
+        _fields_ = [('hwndOwner', w.HWND), ('pidlRoot', c.c_void_p),
+                    ('pszDisplayName', w.LPWSTR), ('lpszTitle', w.LPCWSTR),
+                    ('ulFlags', w.UINT), ('lpfn', callback_type),
+                    ('lParam', w.LPARAM), ('iImage', c.c_int)]
+
+    shell.SHBrowseForFolderW.argtypes = [c.POINTER(BROWSEINFO)]
+    shell.SHBrowseForFolderW.restype = c.c_void_p
+    shell.SHGetPathFromIDListEx.argtypes = [c.c_void_p, w.LPWSTR, w.DWORD, w.DWORD]
+    shell.SHGetPathFromIDListEx.restype = w.BOOL
     ole.CoInitializeEx.argtypes = [c.c_void_p, w.DWORD]
-    ole.CoInitializeEx.restype = hr
-    ole.CoCreateInstance.argtypes = [c.POINTER(GUID), c.c_void_p, w.DWORD, c.POINTER(GUID), c.POINTER(c.c_void_p)]
-    ole.CoCreateInstance.restype = hr
+    ole.CoInitializeEx.restype = c.c_long
     ole.CoTaskMemFree.argtypes = [c.c_void_p]
     ole.CoTaskMemFree.restype = None
-    shell.SHCreateItemFromParsingName.argtypes = [w.LPCWSTR, c.c_void_p, c.POINTER(GUID), c.POINTER(c.c_void_p)]
-    shell.SHCreateItemFromParsingName.restype = hr
+    user.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+    user.SendMessageW.restype = w.LPARAM
+    user.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
+    user.SetForegroundWindow.argtypes = [w.HWND]
+    user.SetWindowPos.argtypes = [w.HWND, w.HWND, c.c_int, c.c_int, c.c_int, c.c_int, w.UINT]
+    start = c.create_unicode_buffer(initial)
 
-    def check(result):
-        if result < 0:
-            raise OSError(f'Windows 系统目录窗口错误：0x{result & 0xffffffff:08x}')
+    @callback_type
+    def initialized(hwnd, message, param, data):
+        if message == 1:  # BFFM_INITIALIZED: the dialog really exists now.
+            user.SetWindowTextW(hwnd, title)
+            if on_ready:
+                on_ready()
+            user.SendMessageW(hwnd, 0x467, 1, c.cast(start, c.c_void_p).value)
+            user.SetWindowPos(hwnd, w.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+            user.SetForegroundWindow(hwnd)
+        return 0
 
-    def call(obj, index, types, *args):
-        vtable = c.cast(obj, c.POINTER(c.POINTER(c.c_void_p))).contents
-        return c.WINFUNCTYPE(hr, c.c_void_p, *types)(vtable[index])(obj, *args)
-
-    check(ole.CoInitializeEx(None, 2))  # STA; helper process has no previous apartment.
-    dialog, folder, result_item = c.c_void_p(), c.c_void_p(), c.c_void_p()
-    name = c.c_void_p()
+    status = ole.CoInitializeEx(None, 2)
+    if status < 0:
+        raise OSError(f'Windows 目录窗口初始化失败：0x{status & 0xffffffff:08x}')
+    item = None
     try:
-        clsid = GUID.parse('DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7')
-        iid = GUID.parse('D57C7288-D4AD-4768-BE02-9D969532D960')
-        shell_iid = GUID.parse('43826D1E-E718-42EE-BC55-A1E261C37BFE')
-        check(ole.CoCreateInstance(c.byref(clsid), None, 1, c.byref(iid), c.byref(dialog)))
-        options = w.DWORD()
-        check(call(dialog, 10, [c.POINTER(w.DWORD)], c.byref(options)))
-        check(call(dialog, 9, [w.DWORD], options.value | 0x20 | 0x40 | 0x800 | 0x2000000))
-        check(call(dialog, 17, [w.LPCWSTR], title))
-        if shell.SHCreateItemFromParsingName(initial, None, c.byref(shell_iid), c.byref(folder)) >= 0:
-            check(call(dialog, 12, [c.c_void_p], folder))
-        status = call(dialog, 3, [w.HWND], None)
-        if status & 0xffffffff == 0x800704c7:  # User cancellation.
+        display = c.create_unicode_buffer(260)
+        info = BROWSEINFO(None, None, c.cast(display, w.LPWSTR), title, 0x0001 | 0x0010 | 0x0040,
+                          initialized, 0, 0)
+        item = shell.SHBrowseForFolderW(c.byref(info))
+        if not item:
             return None
-        check(status)
-        check(call(dialog, 20, [c.POINTER(c.c_void_p)], c.byref(result_item)))
-        check(call(result_item, 5, [w.DWORD, c.POINTER(c.c_void_p)], 0x80058000, c.byref(name)))
-        return c.wstring_at(name)
+        selected = c.create_unicode_buffer(32768)
+        if not shell.SHGetPathFromIDListEx(item, selected, len(selected), 0):
+            raise ValueError('请选择本机或网络上的文件夹')
+        return selected.value
     finally:
-        if name: ole.CoTaskMemFree(name)
-        for item in [result_item, folder, dialog]:
-            if item: call(item, 2, [])
+        if item:
+            ole.CoTaskMemFree(item)
         ole.CoUninitialize()
 
 
 if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--windows-helper':
     # ASCII JSON is independent of the active Windows console code page.
-    print(json.dumps({'path': windows_folder(sys.argv[2], sys.argv[3])}, ensure_ascii=True))
+    def ready():
+        print(json.dumps({'ready': True}), flush=True)
+    try:
+        selected = windows_folder(sys.argv[2], sys.argv[3], ready)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        sys.exit(1)
+    print(json.dumps({'path': selected}, ensure_ascii=True), flush=True)

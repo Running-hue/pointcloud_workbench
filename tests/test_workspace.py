@@ -1,11 +1,12 @@
 import json
+import io
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from http.server import ThreadingHTTPServer
@@ -86,6 +87,19 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(self.ws.job['status'],'failed')
         self.assertEqual(len(self.ws.job['skipped']),1)
         self.assertFalse((self.root/'generated').exists())
+
+    def test_foreign_settings_do_not_reuse_other_os_directories(self):
+        foreign = '/Users/mac-user/data' if __import__('os').name == 'nt' else r'C:\Users\windows-user\data'
+        settings = {key: foreign for key in ('source', 'segmentation', 'results', 'export_parent')}
+        state_dir = self.root/'foreign-state'
+        state_dir.mkdir()
+        write_json(state_dir/'settings.json', settings)
+        restored = Workspace(state_dir)
+        state = restored.state()
+        self.assertIn('其他操作系统', state['warning'])
+        self.assertEqual(state['source'], '')
+        self.assertNotEqual(state['export_parent'], foreign)
+        self.assertEqual(read_json(state_dir/'settings.json'), settings)
 
     def test_protect_sources_existing_outputs_and_stale_page(self):
         for parent, name in [(self.source,'output'),(self.seg,'output'),(self.root,'raw')]:
@@ -252,12 +266,84 @@ class NativePickerTest(unittest.TestCase):
     def test_native_dispatch_cancel_and_unicode_path(self):
         with tempfile.TemporaryDirectory(prefix='点云 ') as root:
             for platform, output in [('darwin',root+'\n'),('win32',json.dumps({'path':root}))]:
-                with self.subTest(platform=platform), patch.object(native_picker.sys,'platform',platform), patch.object(native_picker.subprocess,'run',return_value=subprocess.CompletedProcess([],0,output,'')) as run:
+                with self.subTest(platform=platform), patch.object(native_picker.sys,'platform',platform), patch.object(native_picker, 'run_windows_picker', return_value=subprocess.CompletedProcess([],0,output,'')) as windows, patch.object(native_picker.subprocess,'run',return_value=subprocess.CompletedProcess([],0,output,'')) as mac:
                     self.assertEqual(native_picker.choose_directory(root)['path'],str(Path(root).resolve()))
-                    args = run.call_args.args[0]
+                    args = (mac if platform == 'darwin' else windows).call_args.args[0]
                     self.assertIn('/usr/bin/osascript' if platform == 'darwin' else '--windows-helper',args)
             with patch.object(native_picker.sys,'platform','darwin'), patch.object(native_picker.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'\n','')):
                 self.assertTrue(native_picker.choose_directory(root)['cancelled'])
+
+    @unittest.skipUnless(__import__('os').name == 'nt', 'Windows shell bindings')
+    def test_windows_shell_unicode_cancel_and_native_resource_cleanup(self):
+        import ctypes
+        for mode in ('selected', 'cancelled', 'invalid'):
+            shell, ole, user = Mock(), Mock(), Mock()
+            ole.CoInitializeEx.return_value = 0
+            ready = Mock()
+            def browse(info_ptr):
+                info_ptr._obj.lpfn(123, 1, 0, 0)
+                ready.assert_called_once()
+                return None if mode == 'cancelled' else 456
+            shell.SHBrowseForFolderW.side_effect = browse
+            def selected(item, buffer, length, flags):
+                buffer.value = r'C:\点云数据\采集 01'
+                return mode != 'invalid'
+            shell.SHGetPathFromIDListEx.side_effect = selected
+            libraries = {'shell32': shell, 'ole32': ole, 'user32': user}
+            with self.subTest(mode=mode), patch.object(ctypes, 'WinDLL', side_effect=lambda name, **kw: libraries[name]):
+                if mode == 'invalid':
+                    with self.assertRaisesRegex(ValueError, '请选择'):
+                        native_picker.windows_folder('选择原始目录', str(Path.home()), ready)
+                else:
+                    result = native_picker.windows_folder('选择原始目录', str(Path.home()), ready)
+                    self.assertEqual(result, None if mode == 'cancelled' else r'C:\点云数据\采集 01')
+            ole.CoUninitialize.assert_called_once()
+            if mode == 'cancelled':
+                ole.CoTaskMemFree.assert_not_called()
+            else:
+                ole.CoTaskMemFree.assert_called_once_with(456)
+
+    def test_foreign_initial_path_uses_home(self):
+        foreign = '/Users/mac-user/Documents/data' if __import__('os').name == 'nt' else r'C:\Users\windows-user\data'
+        self.assertEqual(native_picker.initial_directory(foreign), Path.home().resolve())
+
+    def test_windows_startup_timeout_terminates_helper_and_releases_lock(self):
+        process = Mock()
+        process.stdout = io.StringIO('')
+        process.poll.return_value = None
+        process.communicate.return_value = ('', '')
+        with patch.object(native_picker.sys, 'platform', 'win32'), \
+                patch.object(native_picker.subprocess, 'Popen', return_value=process), \
+                patch.object(native_picker.queue.Queue, 'get', side_effect=native_picker.queue.Empty):
+            with self.assertRaisesRegex(ValueError, '启动超时.*bat'):
+                native_picker.choose_directory()
+        process.kill.assert_called_once()
+        self.assertFalse(native_picker.PICKER_LOCK.locked())
+
+    def test_windows_ready_then_unicode_result_or_cancel(self):
+        for result in [str(Path.home()), None]:
+            process = Mock()
+            process.stdout = io.StringIO('{"ready": true}\n')
+            process.returncode = 0
+            process.poll.return_value = 0
+            process.communicate.return_value = (json.dumps({'path': result}), '')
+            with self.subTest(result=result), patch.object(native_picker.sys, 'platform', 'win32'), \
+                    patch.object(native_picker.subprocess, 'Popen', return_value=process):
+                selected = native_picker.choose_directory()
+                self.assertEqual(selected['cancelled'], result is None)
+                self.assertEqual(selected['path'], result)
+            process.kill.assert_not_called()
+
+    def test_windows_failure_before_ready_reports_error_and_releases_lock(self):
+        process = Mock()
+        process.stdout = io.StringIO('')
+        process.poll.return_value = 1
+        process.communicate.return_value = ('', 'COM initialization failed')
+        with patch.object(native_picker.sys, 'platform', 'win32'), \
+                patch.object(native_picker.subprocess, 'Popen', return_value=process):
+            with self.assertRaisesRegex(ValueError, 'COM initialization failed'):
+                native_picker.choose_directory()
+        self.assertFalse(native_picker.PICKER_LOCK.locked())
 
     def test_picker_failure_releases_lock(self):
         with patch.object(native_picker.sys,'platform','darwin'), patch.object(native_picker.subprocess,'run',side_effect=subprocess.TimeoutExpired('picker',600)):

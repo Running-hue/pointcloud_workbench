@@ -184,7 +184,7 @@ async function poll() {
   }
 }
 async function choose(field, title) {
-  message('系统文件夹窗口已打开，请选择目录或取消。');
+  message('正在打开系统文件夹窗口，请选择目录或取消。');
   const result = await api('choose_directory', {path: $(field).value, title});
   if (!result.cancelled) { $(field).value = result.path; message(); }
   else message('已取消选择，保留原路径。');
@@ -207,7 +207,7 @@ $('directoryDialog').addEventListener('close', () => {
   if (returnExportScope) { const scope = returnExportScope; returnExportScope = null; openExport(scope); }
 });
 $('openResults').onclick = () => action(async () => {
-  message('系统文件夹窗口已打开，请选择已有点云成果根目录。');
+  message('正在打开系统文件夹窗口，请选择已有点云成果根目录。');
   const result = await api('choose_directory', {path: state.results || $('parent').value, title:'打开已有点云成果目录'});
   if (result.cancelled) { message('已取消选择。'); return; }
   accept(await api('open_results', {path: result.path})); message('已载入点云目录：' + result.path);

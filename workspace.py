@@ -5,7 +5,7 @@ import copy
 from datetime import datetime
 import hashlib
 from html import escape
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import secrets
 import shutil
 import tempfile
@@ -87,6 +87,16 @@ class Workspace:
                 self.settings = read_json(settings_file)
             except (ValueError, OSError):
                 self.warning = '上次路径记录无法读取，请重新选择目录'
+        # Local settings may have travelled with the repository from another OS.
+        foreign_paths = []
+        for key in ('source', 'segmentation', 'results', 'export_parent'):
+            value = self.settings.get(key)
+            if isinstance(value, str) and not Path(value).is_absolute() and (
+                    PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()):
+                foreign_paths.append(key)
+                self.settings.pop(key)
+        if foreign_paths:
+            self.warning = '检测到其他操作系统保存的路径，请在本机重新选择输入与导出目录'
         seg = initial_segmentation or self.settings.get('segmentation')
         if seg:
             try:
