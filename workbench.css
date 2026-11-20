@@ -12,3 +12,9 @@ dialog{max-width:calc(100vw - 40px);width:680px;max-height:calc(100dvh - 40px);o
 #generationHint{font-size:12px;color:var(--muted);padding:6px 20px;flex-shrink:0;border-top:1px solid var(--line)}
 #datasetSummary{white-space:pre-line}
 #generationHint{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.jobsummary{min-height:25px}.jobsummary #jobCounts{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
+.jobpanel.finished{padding:4px 20px}.jobpanel.finished #jobTitle{color:var(--green);white-space:nowrap}
+#jobToggle{flex-shrink:0}#jobBody{max-height:180px;overflow:auto}#jobCurrent{padding:3px 0}
+#jobErrors{position:static;max-height:120px;margin-top:5px;overflow-wrap:anywhere;box-shadow:none}
+#jobDetails summary{cursor:pointer;color:var(--muted)}

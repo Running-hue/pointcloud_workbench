@@ -142,3 +142,53 @@ test('results from another segmentation can be viewed but require reloading inpu
   assert.equal(ui.elements.get('generate').disabled,true);
   assert.match(ui.elements.get('generationHint').textContent,/不是同一批输入/);
 });
+
+test('finished jobs use a collapsed summary and keep failure records accessible', async () => {
+  const job={id:'done',mode:'generate',status:'completed_with_errors',done:2,total:2,success:1,
+    output:'/clouds',current:'已保存',skipped:[],errors:[{relative_dir:'pig_2/capture',error:'深度缺失'}]};
+  const ui=await setup({...dataset,job});
+  assert.equal(ui.elements.get('jobBody').hidden,true);
+  assert.equal(ui.elements.get('jobToggle').hidden,false);
+  assert.match(ui.elements.get('jobCounts').textContent,/失败 1/);
+  ui.elements.get('jobToggle').onclick();
+  assert.equal(ui.elements.get('jobBody').hidden,false);
+  assert.match(ui.elements.get('jobCurrent').textContent,/\/clouds/);
+  assert.match(ui.elements.get('jobErrors').children[0].textContent,/深度缺失/);
+  ui.elements.get('jobToggle').onclick();
+  assert.equal(ui.elements.get('jobBody').hidden,true);
+});
+
+test('running progress stays visible and collapses when the job finishes', async () => {
+  const job={id:'running',mode:'generate',status:'running',done:1,total:2,success:1,
+    current:'pig_2/capture',skipped:[],errors:[]};
+  const ui=await setup({...dataset,job});
+  assert.equal(ui.elements.get('jobBody').hidden,false);
+  assert.equal(ui.elements.get('jobToggle').hidden,true);
+  assert.equal(ui.elements.get('generationHint').hidden,true);
+  ui.run("state.job.status='completed'; renderJob();");
+  assert.equal(ui.elements.get('jobBody').hidden,true);
+  assert.equal(ui.elements.get('jobToggle').hidden,false);
+});
+
+test('viewing clouds hides generation instructions until input directories change', async () => {
+  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100})]});
+  assert.equal(ui.elements.get('generationHint').hidden,true);
+  ui.elements.get('source').value='/different-input';
+  ui.elements.get('source').listeners.input();
+  assert.equal(ui.elements.get('generationHint').hidden,false);
+  assert.match(ui.elements.get('generationHint').textContent,/输入目录已更改/);
+});
+
+test('successful polling leaves one job summary while failures and warnings remain visible', async () => {
+  for (const warning of ['', '有采集需要复核']) {
+    const active={id:'poll',mode:'generate',status:'running',done:0,total:1,success:0,errors:[],skipped:[]};
+    const job={...active,status:'completed',done:1,success:1,output:'/clouds',warning};
+    const ui=await setup({...dataset,job:active});
+    ui.sandbox.reply=async url=>url==='/api/job' ? {job} : {...dataset,job,clouds:1,results:'/clouds',
+      frames:[frame('1',{has_cloud:true,points:100})]};
+    await ui.run('poll()');
+    assert.equal(ui.elements.get('message').textContent,warning);
+    assert.equal(ui.elements.get('jobBody').hidden,true);
+    assert.equal(ui.elements.get('generationHint').hidden,true);
+  }
+});

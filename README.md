@@ -55,7 +55,7 @@ python3 pointcloud_workbench/batch.py \
   --output outputs/itof_多模态毫米点云
 ```
 
-当前本机启动脚本自动优先使用 Codex 自带 Python，OpenCV 沿用 `segmentation_workbench/.deps`。换电脑时可安装本目录 `requirements.txt`。
+点云工作台自带 IR／RGB 几何校验与图像映射代码，可独立运行，不需要安装或复制分割工作台的 Python 模块。换电脑时安装本目录 `requirements.txt` 即可；已有分割成果中的标定、源文件校验值和几何编号仍会严格核对。
 
 当前没有已确认帧时，正式命令会如实报告跳过数量，生成空的结果索引，不把初稿自动当成合格结果。该步骤不要求先审核完全部图片，确认一张即可生成一张。
 

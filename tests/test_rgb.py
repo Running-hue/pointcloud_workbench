@@ -7,8 +7,8 @@ from pointcloud_workbench.core import (np, Image, read_json, write_json, sha256,
                                        export_frame, display_ir)
 from pointcloud_workbench.viewer import write_viewer
 from pointcloud_workbench.workspace import Workspace
-from segmentation_workbench.geometry import prepare_frame
-from segmentation_workbench.tests.geometry_fixture import calibration, profile
+from pointcloud_workbench.geometry import prepare_frame
+from pointcloud_workbench.tests.geometry_fixture import calibration, profile
 
 
 class RGBCloudTest(unittest.TestCase):

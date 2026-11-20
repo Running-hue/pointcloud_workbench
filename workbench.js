@@ -2,6 +2,7 @@
 const $ = id => document.getElementById(id);
 let state, selected = new Set(), current = null, busy = false, viewerKey = '', pollTimer;
 let appToken = APP_TOKEN, sessionRefresh, returnExportScope;
+let jobViewKey = '', jobExpanded = false;
 const running = () => ['running', 'stopping'].includes(state?.job?.status);
 const dirty = () => state && ($('source').value.trim() !== state.source || $('segmentation').value.trim() !== state.segmentation);
 const message = (text = '', error = false) => {
@@ -104,10 +105,22 @@ function renderViewer() {
 function renderJob() {
   const job = state.job; $('jobPanel').hidden = !job;
   if (!job) return;
-  $('jobPanel').classList.toggle('finished', !running());
+  const active = running();
+  const viewKey = `${job.id}:${active ? 'active' : 'finished'}`;
+  if (viewKey !== jobViewKey) {
+    jobViewKey = viewKey; jobExpanded = false; $('jobDetails').open = false;
+  }
+  $('jobPanel').classList.toggle('finished', !active);
+  $('jobBody').hidden = !active && !jobExpanded;
+  $('jobToggle').hidden = active;
+  $('jobToggle').textContent = jobExpanded ? '收起详情' : '查看详情';
+  $('jobToggle').setAttribute('aria-expanded', String(jobExpanded));
   const status = {running:'处理中', stopping:'准备停止', completed:'完成', completed_with_errors:'部分完成', stopped:'已停止', failed:'失败'}[job.status];
   $('jobTitle').textContent = (job.mode === 'generate' ? '生成点云' : '按文件夹导出') + ' · ' + status;
-  $('jobCounts').textContent = `${job.done} / ${job.total}，成功 ${job.success}`;
+  $('jobCounts').textContent = [`${job.done} / ${job.total}，成功 ${job.success}`,
+    job.errors.length ? `失败 ${job.errors.length}` : '',
+    job.skipped.length ? `跳过 ${job.skipped.length}` : '', job.error ? '有错误' : '',
+    job.warning ? '有提醒' : ''].filter(Boolean).join(' · ');
   $('progress').max = job.total || 1; $('progress').value = job.done;
   $('jobCurrent').textContent = [job.current, !running() && job.success ? job.output : '', job.error, job.warning].filter(Boolean).join(' · ');
   $('stop').hidden = !running(); $('stop').disabled = busy || job.status === 'stopping';
@@ -115,6 +128,7 @@ function renderJob() {
   $('jobDetails').hidden = !errors.length; $('jobErrors').replaceChildren();
   for (const text of errors) { const p = document.createElement('p'); p.textContent = text; $('jobErrors').append(p); }
 }
+$('jobToggle').onclick = () => { jobExpanded = !jobExpanded; renderJob(); };
 function controls() {
   const locked = busy || running();
   document.querySelectorAll('.browse').forEach(el => { el.disabled = locked; });
@@ -126,6 +140,7 @@ function controls() {
   $('generate').title = plan.error || plan.hint;
   $('generationHint').textContent = running() ? '任务处理中，请等待完成或停止后重新选择目录。' : plan.error || plan.hint;
   $('generationHint').title = $('generationHint').textContent;
+  $('generationHint').hidden = running() || !!(state?.clouds && !dirty() && state.results_match_inputs !== false);
   $('export').disabled = locked || !state?.clouds;
   $('exportCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud;
   $('reveal').disabled = busy || !state?.results;
@@ -176,7 +191,7 @@ async function poll() {
       if (state.dataset_id !== datasetId || state.job?.id !== jobId) return;
       accept(fresh);
       if (job?.success) { $('name').value = state.suggested_name; controls(); }
-      message(job?.error || (job?.success ? `已保存 ${job.success} 次采集：${job.output}` : '任务已停止'), job?.status === 'failed');
+      message(job?.error || job?.warning || state.warning || '', !!(job?.error || state.warning));
     }
   } catch(e) {
     if (state.dataset_id !== datasetId || state.job?.id !== jobId) return;
@@ -210,7 +225,7 @@ $('openResults').onclick = () => action(async () => {
   message('正在打开系统文件夹窗口，请选择已有点云成果根目录。');
   const result = await api('choose_directory', {path: state.results || $('parent').value, title:'打开已有点云成果目录'});
   if (result.cancelled) { message('已取消选择。'); return; }
-  accept(await api('open_results', {path: result.path})); message('已载入点云目录：' + result.path);
+  accept(await api('open_results', {path: result.path})); message(state.warning || '', !!state.warning);
 });
 async function loadDirectories(close = false) {
   accept(await api('load', {source:$('source').value.trim(), segmentation:$('segmentation').value.trim()}), true);

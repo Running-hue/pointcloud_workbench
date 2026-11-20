@@ -4,7 +4,7 @@ import sys
 
 from .core import (VERSION, Image, np, cv2, source_files, sha256, choose_mask, read_json,
                    backproject, project, discontinuities, camera_identity, export_metadata)
-from segmentation_workbench.geometry import prepare_frame, validate_mask_region, RGB_VERSION
+from .geometry import prepare_frame, validate_mask_region, RGB_VERSION
 
 
 def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, visibility_mm):

@@ -122,6 +122,23 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(len(body), 34*28)
         self.assertEqual(before, {p.name:sha256(p) for p in self.source.iterdir()})
 
+    def test_saved_ir_geometry_works_without_segmentation_app(self):
+        from pointcloud_workbench.geometry import prepare_frame
+        _, _, geometry, _ = prepare_frame(self.source, 'infrared')
+        self.meta['geometry'] = geometry
+        write_json(self.seg/'segmentation.json', self.meta)
+        before = {p.name: sha256(p) for p in self.source.iterdir()}
+        payload, report, mask = reconstruct(self.source, self.seg, True)
+        self.assertEqual(report['stats']['points'], 34)
+        self.assertEqual(report['unit'], 'mm')
+        export_frame(self.root/'verified-ir', payload, report, mask)
+        self.assertEqual(before, {p.name: sha256(p) for p in self.source.iterdir()})
+        # Preserve the geometry identity gate instead of ignoring recorded geometry.
+        self.meta['geometry']['geometry_id'] = 'stale'
+        write_json(self.seg/'segmentation.json', self.meta)
+        with self.assertRaisesRegex(ValueError, '标定或深度来源已变化'):
+            reconstruct(self.source, self.seg, True)
+
     def test_reviewed_mask_can_enter_normal_workflow(self):
         self.meta.update(reviewed=True,status='reviewed')
         write_json(self.seg/'segmentation.json',self.meta)

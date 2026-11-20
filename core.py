@@ -12,7 +12,6 @@ import json
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'segmentation_workbench' / '.deps'))
 import cv2
 import numpy as np
 from PIL import Image
@@ -284,7 +283,7 @@ def reconstruct(source, segmentation, allow_draft=False, max_rgb_delta_us=10000,
         raise ValueError('红外、深度、掩码尺寸或数据非法')
     profile = verify_ir_depth(record, codes.shape)
     if meta.get('geometry'):
-        from segmentation_workbench.geometry import prepare_frame
+        from .geometry import prepare_frame
         _, _, geometry, _ = prepare_frame(source, 'infrared')
         if meta['geometry'].get('geometry_id') != geometry['geometry_id']:
             raise ValueError('IR 分割的标定或深度来源已变化，请重新核对分割成果')
@@ -399,7 +398,7 @@ def export_frame(destination, payload, report, mask):
     (dest/primary_ply(report)).write_bytes(ply_bytes(payload, colors))
     write_json(dest/'pointcloud.json', export_metadata(report))
     if report.get('input_mode') == 'rgb':
-        from segmentation_workbench.geometry import prepare_frame
+        from .geometry import prepare_frame
         overlay, _, geometry, _ = prepare_frame(Path(report['source_dir']), 'rgb')
         if geometry['geometry_id'] != report['geometry_id']:
             raise ValueError('导出检查图时标定或深度已变化，请重新生成')
