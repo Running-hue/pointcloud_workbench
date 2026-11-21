@@ -4,6 +4,14 @@ let state, selected = new Set(), current = null, busy = false, viewerKey = '', p
 let appToken = APP_TOKEN, sessionRefresh, returnExportScope;
 const running = () => ['running', 'stopping'].includes(state?.job?.status);
 const dirty = () => state && ($('source').value.trim() !== state.source || $('segmentation').value.trim() !== state.segmentation);
+const checkFailed = row => !!row.validation_errors?.length || !!row.missing.length;
+const blocked = row => checkFailed(row) || !!row.excluded;
+const cameraType = row => {
+  const types = [row.has_cloud && row.cloud_camera?.type, row.camera?.type];
+  return types.find(type => ['itof', 'stereo'].includes(type)) || 'unknown';
+};
+const cameraLabel = row => ({itof:'iToF', stereo:'双目', unknown:'相机待识别'}[cameraType(row)]);
+const segmentationMode = row => row.has_cloud ? row.cloud_input_mode || row.input_mode : row.input_mode;
 const message = (text = '', error = false) => {
   for (const id of ['message', 'directoryMessage']) { $(id).textContent = text; $(id).title = text; $(id).classList.toggle('error', error); }
 };
@@ -50,11 +58,40 @@ function accept(data, paths = false) {
   if (state.warning) message(state.warning, true);
   if (running()) schedulePoll();
 }
+function renderFilters() {
+  const rows = state.frames;
+  const fill = (id, choices) => {
+    const element = $(id), previous = element.value || 'all';
+    element.replaceChildren();
+    for (const [value, label, count] of choices) {
+      const option = document.createElement('option');
+      option.value = value; option.textContent = `${label}（${count}）`;
+      element.append(option);
+    }
+    element.value = choices.some(([value]) => value === previous) ? previous : 'all';
+  };
+  const cameras = [['all', '全部相机', rows.length],
+    ['itof', 'iToF', rows.filter(r => cameraType(r) === 'itof').length],
+    ['stereo', '双目', rows.filter(r => cameraType(r) === 'stereo').length]];
+  const unknown = rows.filter(r => cameraType(r) === 'unknown').length;
+  if (unknown) cameras.push(['unknown', '未识别相机', unknown]);
+  fill('cameraFilter', cameras);
+  const modes = [['all', '全部分割', rows.length],
+    ['rgb', 'RGB 分割', rows.filter(r => segmentationMode(r) === 'rgb').length],
+    ['infrared', 'IR 分割', rows.filter(r => segmentationMode(r) === 'infrared').length]];
+  const unknownModes = rows.filter(r => !['rgb', 'infrared'].includes(segmentationMode(r))).length;
+  if (unknownModes) modes.push(['unknown', '未识别来源', unknownModes]);
+  fill('modeFilter', modes);
+}
 function visibleRows() {
   const query = $('search').value.toLowerCase().trim(), filter = $('filter').value;
-  return state.frames.filter(r => (!query || `${r.pig_id} ${r.capture_id} ${r.relative_dir}`.toLowerCase().includes(query)) &&
+  const camera = $('cameraFilter').value || 'all', mode = $('modeFilter').value || 'all';
+  return state.frames.filter(r => (camera === 'all' || cameraType(r) === camera) &&
+    (mode === 'all' || (segmentationMode(r) || 'unknown') === mode) &&
+    (!query || `${r.pig_id} ${r.capture_id} ${r.relative_dir}`.toLowerCase().includes(query)) &&
     (filter === 'all' || filter === 'cloud' && r.has_cloud || filter === 'reviewed' && r.reviewed ||
-     filter === 'draft' && !r.reviewed && !r.missing.length || filter === 'missing' && r.missing.length));
+     filter === 'draft' && !r.reviewed && !blocked(r) || filter === 'missing' && r.missing.length ||
+     filter === 'failed' && checkFailed(r) || filter === 'excluded' && r.excluded));
 }
 function renderList() {
   const rows = visibleRows();
@@ -68,17 +105,20 @@ function renderList() {
     const title = document.createElement('strong'); title.textContent = '耳标 ' + row.pig_id;
     const capture = document.createElement('span'); capture.className = 'capture'; capture.textContent = row.capture_id;
     const chips = document.createElement('span'); chips.className = 'chips';
-    const mode = row.has_cloud ? row.cloud_input_mode : row.input_mode;
-    chips.textContent = [mode === 'rgb' ? 'RGB 分割' : mode === 'infrared' ? 'IR 分割' : '',
+    const mode = segmentationMode(row);
+    chips.textContent = [cameraLabel(row), mode === 'rgb' ? 'RGB 分割' : mode === 'infrared' ? 'IR 分割' : '',
       row.has_cloud ? `${row.points.toLocaleString()} 点` : '未生成',
       row.reviewed ? '分割已确认' : '分割待确认', row.decision === 'reject' ? '已淘汰' : '',
-      row.missing.length ? '缺失 ' + row.missing.length + ' 项' : ''].filter(Boolean).join(' · ');
-    if (row.missing.length || row.decision === 'reject') chips.classList.add('warn');
-    item.title = row.relative_dir + (row.missing.length ? '\n缺少：' + row.missing.join('、') : '');
+      checkFailed(row) ? '核对失败 · 自动跳过' : '', row.excluded ? '已标记跳过' : ''].filter(Boolean).join(' · ');
+    if (blocked(row) || row.decision === 'reject') chips.classList.add('warn');
+    item.title = row.relative_dir + (row.validation_errors?.length ? '\n'+row.validation_errors.join('\n') :
+      row.missing.length ? '\n缺少：'+row.missing.join('、') : '');
     button.append(title, capture, chips); button.onclick = () => { current = row.id; renderList(); renderViewer(); controls(); };
     item.append(check, button); $('frames').append(item);
   }
-  $('selectedCount').textContent = `已勾选 ${selected.size}`;
+  const visibleIds = new Set(rows.map(r => r.id)), hiddenSelection = [...selected].filter(id => !visibleIds.has(id)).length;
+  $('selectedCount').textContent = `已勾选 ${selected.size}` + (hiddenSelection ? ` · 隐藏 ${hiddenSelection}` : '');
+  $('selectedCount').title = hiddenSelection ? `当前筛选外还有 ${hiddenSelection} 次已勾选采集，生成／导出已勾选范围时会一并处理。` : '';
   $('selectAll').checked = rows.length > 0 && rows.every(r => selected.has(r.id));
   $('selectAll').indeterminate = rows.some(r => selected.has(r.id)) && !$('selectAll').checked;
   $('listFooter').textContent = `显示 ${rows.length} / ${state.frames.length} 次采集 · 已生成 ${state.clouds}`;
@@ -88,7 +128,7 @@ function media(row, file) {
 }
 function renderViewer() {
   const row = state.frames.find(r => r.id === current);
-  const camera = {stereo:'双目',itof:'iToF'}[row?.cloud_camera?.type];
+  const camera = row ? cameraLabel(row) : '';
   const mode = row?.cloud_input_mode || row?.input_mode;
   $('currentTitle').textContent = row ? [camera,mode === 'rgb' ? 'RGB 分割' : mode === 'infrared' ? 'IR 分割' : '',
     `${row.pig_id} / ${row.capture_id}`].filter(Boolean).join(' · ') : '选择一次采集查看点云';
@@ -99,15 +139,46 @@ function renderViewer() {
   }
   const key = row?.has_cloud ? media(row, 'preview.html') + '&job=' + (state.job?.id || '') : '';
   $('viewer').hidden = !key; $('empty').hidden = !!key;
+  const issue = row?.validation_errors?.join('；') || (row?.missing.length ? '缺少：'+row.missing.join('、') : '');
+  $('captureIssue').hidden = !issue && !row?.excluded;
+  $('captureIssue').textContent = [issue ? '核对失败，生成时自动跳过：'+issue : '', row?.excluded ? '本采集已手动标记为跳过。' : ''].filter(Boolean).join('\n');
   if (key !== viewerKey) { key ? $('viewer').src = key : $('viewer').removeAttribute('src'); viewerKey = key; }
+}
+function validationSummary() {
+  const rows = state?.frames || [], checked = rows.filter(r => r.input_loaded !== false);
+  const failed = checked.filter(checkFailed).length, excluded = checked.filter(r => r.excluded).length;
+  return `目录核对：通过 ${checked.length-failed} 次，失败 ${failed} 次；手动标记跳过 ${excluded} 次。`;
+}
+function renderValidation() {
+  $('validationSummary').textContent = validationSummary();
+  const issues = state.frames.filter(r => checkFailed(r) || r.excluded);
+  $('directoryValidation').hidden = !issues.length || dirty();
+  $('validationIssues').replaceChildren();
+  if (!issues.length) $('validationIssues').textContent = '没有核对失败或已标记跳过的采集。';
+  for (const row of issues) {
+    const item = document.createElement('section'); item.className = 'validationitem';
+    const info = document.createElement('div'), title = document.createElement('strong'), reason = document.createElement('p');
+    title.textContent = row.relative_dir;
+    reason.textContent = [row.validation_errors?.join('；') || (row.missing.length ? '缺少：'+row.missing.join('、') : ''),
+      row.excluded ? '已手动标记跳过' : '核对失败，生成时自动跳过'].filter(Boolean).join(' · ');
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'markskip';
+    button.textContent = row.excluded ? '取消标记' : '标记跳过'; button.disabled = busy || running() || row.input_loaded === false;
+    button.onclick = () => action(() => markSkipped([row.id], !row.excluded));
+    info.append(title, reason); item.append(info, button); $('validationIssues').append(item);
+  }
+  $('downloadValidation').href = '/api/validation?'+new URLSearchParams({dataset_id:state.dataset_id});
 }
 function renderJob() {
   const job = state.job; $('jobPanel').hidden = !job;
+  $('showJob').hidden = !job;
   if (!job) return;
   $('jobPanel').classList.toggle('finished', !running());
   const status = {running:'处理中', stopping:'准备停止', completed:'完成', completed_with_errors:'部分完成', stopped:'已停止', failed:'失败'}[job.status];
   $('jobTitle').textContent = (job.mode === 'generate' ? '生成点云' : '按文件夹导出') + ' · ' + status;
   $('jobCounts').textContent = `${job.done} / ${job.total}，成功 ${job.success}`;
+  const problems = job.errors.length + job.skipped.length;
+  $('showJob').textContent = `${status} ${job.done}/${job.total}${problems ? ' · '+problems+' 项待查看' : ''} · 详情`;
+  $('showJob').title = '查看任务进度、成功数量、跳过与失败原因';
   $('progress').max = job.total || 1; $('progress').value = job.done;
   $('jobCurrent').textContent = [job.current, !running() && job.success ? job.output : '', job.error, job.warning].filter(Boolean).join(' · ');
   $('stop').hidden = !running(); $('stop').disabled = busy || job.status === 'stopping';
@@ -129,8 +200,16 @@ function controls() {
   $('export').disabled = locked || !state?.clouds;
   $('exportCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud;
   $('reveal').disabled = busy || !state?.results;
+  const active = state?.frames.find(r => r.id === current);
+  $('toggleExcluded').disabled = locked || !active || active.input_loaded === false;
+  $('toggleExcluded').textContent = active?.excluded ? '取消跳过标记' : '标记跳过';
+  $('excludeFailed').disabled = locked || !state?.frames.some(r => checkFailed(r) && !r.excluded && r.input_loaded !== false);
+  $('showValidation').disabled = !state?.frames.length;
+  $('showValidation').textContent = state ? `核对失败 ${state.frames.filter(checkFailed).length} · 查看／标记` : '查看核对结果／标记';
+  document.querySelectorAll('.markskip').forEach(el => { el.disabled = locked; });
   document.querySelectorAll('.frame>input').forEach(el => { el.disabled = locked; });
   if (state) {
+    $('directoryValidation').hidden = !state.frames.some(r => blocked(r)) || dirty();
     $('datasetSummary').textContent = dirty() ? '输入目录已更改\n请重新核对载入' : `${state.pigs} 头猪 · ${state.frames.length} 次采集\n分割已确认 ${state.reviewed} 次`;
     $('destination').textContent = '导出位置：' + destination();
     $('destination').title = destination();
@@ -148,20 +227,25 @@ function destination() {
   const parent = $('parent').value.trim(), separator = parent.includes('\\') ? '\\' : '/';
   return parent.replace(/[\\/]$/, '') + separator + $('name').value;
 }
-function render() { renderList(); renderViewer(); renderJob(); controls(); }
+function ensureVisibleCapture() {
+  const rows = visibleRows();
+  if (!rows.some(r => r.id === current)) current = (rows.find(r => r.has_cloud) || rows[0])?.id || null;
+}
+function render() { renderFilters(); ensureVisibleCapture(); renderList(); renderViewer(); renderJob(); renderValidation(); controls(); }
 function generationPlan() {
   if (!state?.source || !state?.segmentation) return {error:'请打开“目录设置”，选择原始采集目录与分割目录并载入。'};
   if (state.results_match_inputs === false) return {error:'当前成果与载入的分割不是同一批输入；请在目录设置中重新核对载入后生成。'};
   if (dirty()) return {error:'输入目录已更改，请打开“目录设置”并点击“完成并载入”。'};
-  const rows = state.frames.filter(r => !selected.size || selected.has(r.id));
-  const usable = rows.filter(r => !r.missing.length && r.decision !== 'reject' &&
+  const rows = selected.size ? state.frames.filter(r => selected.has(r.id)) : visibleRows();
+  const usable = rows.filter(r => !blocked(r) && r.decision !== 'reject' &&
     ($('draft').checked || r.reviewed && r.status === 'reviewed'));
   if (!usable.length) return {error: selected.size ?
-    '勾选范围内没有可生成采集：请检查缺失文件、分割确认状态，或显式勾选“允许初稿预览”。' :
-    '没有可生成的已确认采集：请先确认分割，或显式勾选“允许初稿预览”；缺失文件和已淘汰采集会跳过。'};
-  return {ids:(selected.size ? rows : usable).map(r => r.id), hint:selected.size ?
+    '勾选范围内没有可生成采集：请检查核对结果、跳过标记、分割确认状态，或显式勾选“允许初稿预览”。' :
+    '没有可生成的已确认采集：请先确认分割，或显式勾选“允许初稿预览”；核对失败、已标记跳过和已淘汰采集会跳过。'};
+  const skippedHint = ` 核对失败 ${rows.filter(checkFailed).length} 次，手动标记 ${rows.filter(r=>r.excluded).length} 次，均自动跳过。`;
+  return {ids:(selected.size ? rows : usable).map(r => r.id), hint:(selected.size ?
     `已勾选 ${rows.length} 次采集，其中 ${usable.length} 次可生成；可调整勾选后重试。` :
-    `未勾选采集，将生成全部${$('draft').checked ? '可用' : '已确认'}采集，共 ${usable.length} 次；也可在左侧勾选指定范围。`};
+    `未勾选采集，将生成当前筛选范围内全部${$('draft').checked ? '可用' : '已确认'}采集，共 ${usable.length} 次；也可在左侧勾选指定范围。`)+skippedHint};
 }
 function schedulePoll() { clearTimeout(pollTimer); pollTimer = setTimeout(poll, 850); }
 async function poll() {
@@ -214,13 +298,33 @@ $('openResults').onclick = () => action(async () => {
 });
 async function loadDirectories(close = false) {
   accept(await api('load', {source:$('source').value.trim(), segmentation:$('segmentation').value.trim()}), true);
-  message(`匹配完成：${state.frames.filter(r => !r.missing.length).length} 次文件完整，${state.frames.filter(r => r.missing.length).length} 次缺失文件。`);
+  message(validationSummary()+' 失败项自动跳过，不影响其余采集。');
   if (close) $('directoryDialog').close();
 }
 $('load').onclick = () => action(() => loadDirectories());
 $('finishDirectories').onclick = () => action(() => loadDirectories(true));
+async function markSkipped(ids, excluded) {
+  accept(await api('mark_skipped', {dataset_id:state.dataset_id, ids, excluded}));
+  message(excluded ? `已标记 ${ids.length} 次采集为跳过，其余采集可继续生成。` : '已取消手动标记；核对失败项仍自动跳过，修复后请重新核对目录。');
+}
+$('showValidation').onclick = () => { renderValidation(); $('validationDialog').showModal(); };
+$('directoryIssues').onclick = $('showValidation').onclick;
+$('closeValidation').onclick = () => $('validationDialog').close();
+$('excludeFailed').onclick = () => action(() => markSkipped(state.frames.filter(r => checkFailed(r) && !r.excluded && r.input_loaded !== false).map(r=>r.id), true));
+$('toggleExcluded').onclick = () => action(async () => {
+  const row = state.frames.find(r => r.id === current);
+  if (row) await markSkipped([row.id], !row.excluded);
+});
 for (const id of ['source','segmentation','parent','name']) $(id).addEventListener('input', controls);
-for (const id of ['search','filter']) $(id).addEventListener('input', () => { if(state) renderList(); });
+function applyFilters() {
+  if (!state) return;
+  ensureVisibleCapture();
+  renderList(); renderViewer(); controls();
+}
+for (const id of ['search','filter']) $(id).addEventListener('input', applyFilters);
+for (const id of ['cameraFilter','modeFilter']) $(id).onchange = applyFilters;
+$('showJob').onclick = () => $('jobDialog').showModal();
+$('closeJob').onclick = () => $('jobDialog').close();
 $('selectAll').onchange = () => { const checked = $('selectAll').checked; visibleRows().forEach(r => checked ? selected.add(r.id) : selected.delete(r.id)); renderList(); controls(); };
 $('draft').onchange = controls;
 function payload(ids) { return {dataset_id:state.dataset_id, ids, parent:$('parent').value.trim(), name:$('name').value, allow_draft:$('draft').checked}; }

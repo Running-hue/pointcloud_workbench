@@ -11,7 +11,7 @@ if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pointcloud_workbench.core import (independent_paths, within, read_json, write_json,
                                        reconstruct, export_frame, sha256, VERSION, cv2,
-                                       required_result_files, EXPORT_POLICY)
+                                       required_result_files, EXPORT_POLICY, input_mode)
 from pointcloud_workbench.viewer import write_viewer
 
 
@@ -66,6 +66,9 @@ def run(args):
                 mask_path = m/report['mask_file']
                 fresh = report['segmentation_json_sha256'] == sha256(m/'segmentation.json')
                 fresh &= report['version'] == VERSION
+                if input_mode(report) == 'rgb':
+                    from pointcloud_workbench.registration import AUDIT_VERSION
+                    fresh &= report.get('rgb_registration', {}).get('version') == AUDIT_VERSION
                 fresh &= report.get('export_policy') == EXPORT_POLICY
                 fresh &= report['mask_sha256'] == sha256(mask_path)
                 fresh &= all(sha256(s/name) == digest for name, digest in report['source_sha256'].items())

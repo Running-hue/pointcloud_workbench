@@ -142,3 +142,77 @@ test('results from another segmentation can be viewed but require reloading inpu
   assert.equal(ui.elements.get('generate').disabled,true);
   assert.match(ui.elements.get('generationHint').textContent,/不是同一批输入/);
 });
+
+test('failed and manually skipped captures stay visible and never enter automatic generation', async () => {
+  const frames=[frame('1'),frame('2',{reviewed:true,status:'reviewed',
+    validation_errors:['分割清单与逐帧输入模式不一致']}),frame('3',{excluded:true})];
+  const ui=await setup({...dataset,frames,pigs:3});
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['1']);
+  assert.match(ui.elements.get('generationHint').textContent,/核对失败 1 次.*手动标记 1 次/);
+  assert.match(ui.elements.get('showValidation').textContent,/核对失败 1/);
+  ui.elements.get('filter').value='failed';
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['2']);
+  ui.elements.get('filter').value='excluded';
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['3']);
+  ui.run("selected = new Set(['1','2','3']); controls();");
+  assert.equal(ui.elements.get('generate').disabled,false);
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['1','2','3']);
+});
+
+test('marking current capture updates workspace through authenticated API without changing segmentation', async () => {
+  const ui=await setup();
+  ui.sandbox.reply=async(url,payload)=>{
+    assert.equal(url,'/api/mark_skipped');
+    assert.equal(payload.excluded,true);
+    return clone({...dataset,frames:[frame('1',{excluded:true}),dataset.frames[1]]});
+  };
+  await ui.elements.get('toggleExcluded').onclick();
+  const request=ui.requests.find(r=>r.url==='/api/mark_skipped');
+  assert.deepEqual(request.payload,{dataset_id:'one',ids:['1'],excluded:true});
+  assert.equal(ui.elements.get('toggleExcluded').textContent,'取消跳过标记');
+  assert.equal(ui.elements.get('generate').disabled,true);
+  assert.match(ui.elements.get('message').textContent,/标记 1 次采集为跳过/);
+});
+
+test('camera and segmentation filters are independent and use recorded camera metadata', async () => {
+  const rows=[frame('itof-rgb',{camera:{type:'itof'},input_mode:'rgb'}),
+    frame('itof-ir',{camera:{type:'itof'},input_mode:'infrared'}),
+    frame('stereo-rgb',{camera:{type:'stereo'},input_mode:'rgb',relative_dir:'itof_misleading/capture'}),
+    frame('unknown',{input_mode:'rgb'})];
+  const ui=await setup({...dataset,frames:rows});
+  assert.match(ui.elements.get('cameraFilter').children.find(c=>c.value==='itof').textContent,/2/);
+  ui.elements.get('cameraFilter').value='itof';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['itof-rgb','itof-ir']);
+  ui.elements.get('modeFilter').value='infrared';ui.elements.get('modeFilter').onchange();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['itof-ir']);
+  assert.equal(ui.run('current'),'itof-ir');
+  ui.elements.get('cameraFilter').value='stereo';ui.elements.get('modeFilter').value='rgb';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['stereo-rgb']);
+});
+
+test('without explicit selection generation follows the visible camera and segmentation scope', async () => {
+  const ui=await setup({...dataset,frames:[frame('one',{camera:{type:'itof'},input_mode:'rgb'}),
+    frame('two',{camera:{type:'stereo'},input_mode:'rgb'}),frame('three',{camera:{type:'itof'},input_mode:'infrared'})]});
+  ui.elements.get('cameraFilter').value='itof';ui.elements.get('modeFilter').value='rgb';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['one']);
+  await ui.elements.get('generate').onclick();
+  assert.deepEqual(ui.requests.find(r=>r.url==='/api/generate').payload.ids,['one']);
+});
+
+test('empty filtered lists clear the viewer and refresh generation availability', async () => {
+  const ui=await setup({...dataset,frames:[frame('one',{camera:{type:'itof'},input_mode:'rgb'})]});
+  ui.elements.get('cameraFilter').value='stereo';ui.elements.get('cameraFilter').onchange();
+  assert.equal(ui.run('current'),null);
+  assert.equal(ui.elements.get('viewer').hidden,true);
+  assert.equal(ui.elements.get('generate').disabled,true);
+});
+
+test('finished task details remain available from the compact footer', async () => {
+  const ui=await setup({...dataset,job:{id:'done',mode:'generate',status:'completed_with_errors',
+    total:2,done:2,success:1,current:'已保存',output:'/out/result',skipped:[],errors:[{relative_dir:'pig_2/capture',error:'配准失败'}]}});
+  assert.equal(ui.elements.get('showJob').hidden,false);
+  assert.match(ui.elements.get('showJob').textContent,/部分完成 2\/2.*1 项/);
+  ui.elements.get('showJob').onclick();assert.equal(ui.elements.get('jobDialog').open,true);
+  assert.match(ui.elements.get('jobErrors').children[0].textContent,/pig_2\/capture.*配准失败/);
+  ui.elements.get('closeJob').onclick();assert.equal(ui.elements.get('jobDialog').open,false);
+});

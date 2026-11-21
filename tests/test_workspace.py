@@ -87,6 +87,39 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(len(self.ws.job['skipped']),1)
         self.assertFalse((self.root/'generated').exists())
 
+    def test_camera_classification_uses_capture_record_before_generation(self):
+        path = self.source/self.rel/'reconstruction.json'
+        record = read_json(path)
+        for model, kind in [('Orbbec Femto Bolt', 'itof'), ('Orbbec Gemini 336L', 'stereo')]:
+            record['runtime']['device'] = {'name': model}
+            write_json(path, record)
+            state = self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
+            self.assertEqual(state['frames'][0]['camera']['type'], kind)
+
+    def test_export_updates_legacy_preview_without_changing_measured_files(self):
+        generated = self.generate()
+        original = generated/self.rel/'preview.html'
+        original.write_text('<html>legacy dark preview</html>')
+        self.ws.start(self.payload('updated-preview'), 'export'); self.ws.worker.join(10)
+        self.assertEqual(self.ws.job['status'], 'completed', self.ws.job)
+        copied = self.root/'updated-preview'/self.rel
+        self.assertIn('color-scheme:light', (copied/'preview.html').read_text())
+        self.assertIn('legacy dark preview', original.read_text())
+        for name in ['points.npz', 'cloud_ir_mm.ply', 'pointcloud.json']:
+            self.assertEqual(sha256(generated/self.rel/name), sha256(copied/name))
+
+    def test_reopen_restores_terminal_task_details_without_restoring_a_running_job(self):
+        generated = self.generate()
+        restored = Workspace(self.root/'settings')
+        self.assertEqual(restored.state()['job']['status'], 'completed')
+        self.assertEqual(restored.state()['job']['success'], 1)
+        self.assertIsNone(restored.worker)
+        report = read_json(generated/'export.json')
+        for change in [{'status':'running'}, {'status':'stopping'}, {'errors':None}]:
+            write_json(generated/'export.json', {**report, **change})
+            self.assertIsNone(restored.open_results(str(generated))['job'])
+        write_json(generated/'export.json', report)
+
     def test_protect_sources_existing_outputs_and_stale_page(self):
         for parent, name in [(self.source,'output'),(self.seg,'output'),(self.root,'raw')]:
             with self.assertRaises(ValueError): self.ws.start({**self.payload(allow_draft=True),'parent':str(parent),'name':name},'generate')
@@ -176,8 +209,11 @@ class WorkspaceTest(unittest.TestCase):
         dataset=read_json(self.seg/'dataset.json')
         dataset['input_mode']='rgb'
         write_json(self.seg/'dataset.json',dataset)
-        with self.assertRaisesRegex(ValueError,'输入模式不一致'):
-            self.ws.load({'source':str(self.source),'segmentation':str(self.seg)})
+        state = self.ws.load({'source':str(self.source),'segmentation':str(self.seg)})
+        self.assertEqual(state['validation']['failed'], 1)
+        self.assertIn('输入模式不一致', state['frames'][0]['validation_errors'][0])
+        with self.assertRaisesRegex(ValueError, '没有可生成项'):
+            self.ws.start(self.payload(allow_draft=True), 'generate')
 
     def test_open_other_segmentation_results_cannot_generate_from_current_inputs(self):
         generated=self.generate()

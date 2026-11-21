@@ -18,7 +18,8 @@ from .core import (independent_paths, within, read_json, write_json, sha256, rec
 from .viewer import write_viewer
 
 RESULT_FILES = {'points.npz', 'cloud_rgb_mm.ply', 'cloud_ir_mm.ply', 'pointcloud.json',
-                'preview.html', 'mask_depth_check.png', 'rgb_projection_check.png'}
+                'preview.html', 'mask_depth_check.png', 'rgb_projection_check.png',
+                'rgb_registration_check.png'}
 
 
 def atomic_json(path, data):
@@ -66,6 +67,79 @@ def safe_copy_tree(source, target):
             raise ValueError('成果包含不支持的文件类型')
 
 
+def check_frame(source, segmentation, declared_mode):
+    """Quarantine a bad capture without guessing its modality or aborting the batch."""
+    meta, errors, missing = {}, [], []
+    path = segmentation/'segmentation.json'
+    if not path.is_file():
+        missing.append('segmentation.json')
+        errors.append('缺少分割记录 segmentation.json')
+    else:
+        try:
+            meta = read_json(path)
+            if not isinstance(meta, dict) or not meta:
+                raise ValueError('分割记录必须是非空 JSON 对象')
+        except (ValueError, OSError) as exc:
+            errors.append(f'分割记录无法读取：{exc}')
+            meta = {}
+    mode = declared_mode
+    if meta:
+        try:
+            mode = input_mode(meta)
+            if declared_mode and mode != declared_mode:
+                errors.append(f'分割清单与逐帧输入模式不一致（清单 {declared_mode}，逐帧 {mode}）')
+        except (ValueError, TypeError) as exc:
+            errors.append(str(exc))
+    # Use the declared mode only to report missing files when metadata is absent.
+    # The validation error above always blocks reconstruction of that frame.
+    try:
+        names = source_files(meta if meta else {'input_mode': declared_mode})
+    except (TypeError, AttributeError) as exc:
+        names = source_files({'input_mode': mode})
+        errors.append(f'分割记录格式无效：{exc}')
+    missing.extend(n for n in names if not (source/n).is_file())
+    mask = 'trunk_mask.png' if meta.get('reviewed') is True and meta.get('status') == 'reviewed' else (
+        'trunk_mask_working.png' if meta.get('status') == 'corrected' else 'trunk_mask_draft.png')
+    if not (segmentation/mask).is_file(): missing.append(mask)
+    file_missing = sorted(set(missing)-{'segmentation.json'})
+    if file_missing: errors.append('缺少文件：'+', '.join(file_missing))
+    # Camera grouping comes from capture metadata, never the directory name or
+    # the segmentation modality (both cameras can have either RGB or IR masks).
+    camera = {'type': 'unknown', 'model': '未知相机'}
+    try:
+        camera = camera_identity(read_json(source/'reconstruction.json'))
+    except (ValueError, OSError, TypeError, AttributeError):
+        pass
+    return {'reviewed': meta.get('reviewed') is True,
+            'status': meta.get('status', 'missing'), 'decision': meta.get('decision', 'pending'),
+            'input_mode': mode, 'camera': camera, 'missing': sorted(set(missing)),
+            'validation_errors': errors, 'validation_status': 'failed' if errors else 'passed',
+            'input_loaded': True}
+
+
+def saved_job(root):
+    """A reopened export can show its completed task without starting a worker."""
+    path = root/'export.json'
+    if path.is_symlink(): return None
+    try:
+        job = read_json(path)
+        if not isinstance(job, dict) or job.get('status') not in {'completed', 'completed_with_errors', 'stopped', 'failed'}:
+            return None
+        if job.get('mode') not in {'generate', 'export'}: return None
+        if any(type(job.get(key)) is not int or job[key] < 0 for key in ('total', 'done', 'success')):
+            return None
+        if not job['success'] <= job['done'] <= job['total']: return None
+        for field, reason in [('skipped', 'reason'), ('errors', 'error')]:
+            if not isinstance(job.get(field), list) or any(
+                    not isinstance(row, dict) or not isinstance(row.get('relative_dir'), str)
+                    or not isinstance(row.get(reason), str) for row in job[field]):
+                return None
+        return {**job, 'id': str(job.get('id') or secrets.token_hex(10)), 'output': str(root),
+                'current': job.get('current') if isinstance(job.get('current'), str) else '已载入保存的任务记录'}
+    except (ValueError, OSError, TypeError):
+        return None
+
+
 class Workspace:
     def __init__(self, state_dir, initial_segmentation=None, initial_results=None):
         self.state_dir = Path(state_dir).resolve()
@@ -109,6 +183,41 @@ class Workspace:
         if self.job and self.job['status'] in {'running', 'stopping'}:
             raise ValueError('正在生成或导出，请先等待完成或停止任务')
 
+    def validation_report(self):
+        with self.lock:
+            return {'schema_version': 1, 'source': str(self.source or ''),
+                    'segmentation': str(self.segmentation or ''),
+                    'summary': {'total': len(self.rows),
+                                'passed': sum(not r.get('validation_errors') for r in self.rows),
+                                'failed': sum(bool(r.get('validation_errors')) for r in self.rows),
+                                'excluded': sum(r.get('excluded', False) for r in self.rows)},
+                    'issues': [{'relative_dir': r['relative_dir'], 'pig_id': r['pig_id'],
+                                'capture_id': r['capture_id'], 'missing': r['missing'],
+                                'errors': list(r.get('validation_errors', [])),
+                                'excluded': r.get('excluded', False)} for r in self.rows
+                               if r.get('validation_errors') or r.get('excluded')]}
+
+    def exclusion_key(self, source, segmentation):
+        return hashlib.sha256((str(source)+'\0'+str(segmentation)).encode()).hexdigest()
+
+    def mark_skipped(self, payload):
+        with self.lock:
+            self.idle()
+            if payload.get('dataset_id') != self.dataset_id:
+                raise ValueError('目录已切换，请刷新后再操作')
+            ids, excluded = payload.get('ids'), payload.get('excluded')
+            known = {r['id'] for r in self.rows}
+            if (not isinstance(ids, list) or not ids or any(not isinstance(i, str) for i in ids)
+                    or len(set(ids)) != len(ids) or not set(ids) <= known or type(excluded) is not bool):
+                raise ValueError('请选择已载入的采集，并指定是否标记跳过')
+            rows = [dict(r, excluded=excluded) if r['id'] in ids else dict(r) for r in self.rows]
+            settings = copy.deepcopy(self.settings)
+            settings.setdefault('skipped_frames', {})[self.exclusion_key(self.source, self.segmentation)] = [
+                r['relative_dir'] for r in rows if r.get('excluded')]
+            atomic_json(self.state_dir/'settings.json', settings)
+            self.rows, self.settings = rows, settings
+            return self.state()
+
     def state(self):
         from .native_picker import supported
         with self.lock:
@@ -124,7 +233,11 @@ class Workspace:
                            infrared_available=r.get('infrared_available', True),
                            has_ir_file=(result['folder']/'cloud_ir_mm.ply').is_file())
             frames = list(merged.values())
-            for row in frames: row.setdefault('has_cloud', False)
+            for row in frames:
+                row.setdefault('has_cloud', False)
+                row.setdefault('validation_errors', [])
+                row.setdefault('excluded', False)
+                row.setdefault('input_loaded', False)
             return {'dataset_id': self.dataset_id, 'source': str(self.source or ''),
                     'segmentation': str(self.segmentation or ''), 'results': str(self.results_root or ''),
                     'last_output': str(self.last_output or ''),
@@ -134,7 +247,8 @@ class Workspace:
                     'results_match_inputs': self.results_match_inputs,
                     'export_parent': self.settings.get('export_parent', str(Path(__file__).resolve().parents[1]/'outputs')),
                     'suggested_name': '点云成果_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:19],
-                    'job': copy.deepcopy(self.job), 'warning': self.warning}
+                    'job': copy.deepcopy(self.job), 'warning': self.warning,
+                    'validation': self.validation_report()['summary']}
 
     def load(self, payload, remember=True):
         source, seg = directory(payload.get('source')), directory(payload.get('segmentation'))
@@ -145,6 +259,7 @@ class Workspace:
         rows, ids, relatives = [], set(), set()
         if not isinstance(ds.get('frames'), list) or not ds['frames']:
             raise ValueError('分割结果清单中没有采集记录')
+        declared_mode = input_mode(ds) if ds.get('input_mode') else None
         for entry in ds['frames']:
             rel = entry['relative_dir']
             s, m = within(source, rel), within(seg, rel)
@@ -153,25 +268,12 @@ class Workspace:
             frame_id = hashlib.sha256(rel.encode()).hexdigest()[:20]
             if frame_id in ids: raise ValueError('采集编号重复')
             ids.add(frame_id)
-            meta = read_json(m/'segmentation.json') if (m/'segmentation.json').is_file() else {}
-            mode = input_mode(meta)
-            if ds.get('input_mode') and mode != input_mode(ds):
-                raise ValueError(f'分割清单与逐帧输入模式不一致：{rel}')
-            missing = [n for n in source_files(meta) if not (s/n).is_file()]
-            if not meta: missing.append('segmentation.json')
-            mask = 'trunk_mask.png' if meta.get('reviewed') is True and meta.get('status') == 'reviewed' else (
-                'trunk_mask_working.png' if meta.get('status') == 'corrected' else 'trunk_mask_draft.png')
-            if not (m/mask).is_file(): missing.append(mask)
             rows.append({'id': frame_id, 'relative_dir': rel, 'pig_id': str(entry['pig_id']),
-                         'capture_id': entry['capture_id'], 'reviewed': meta.get('reviewed') is True,
-                         'status': meta.get('status', 'missing'), 'decision': meta.get('decision', 'pending'),
-                         'input_mode': mode,
-                         'missing': sorted(missing)})
-        if all(r['missing'] for r in rows):
-            example = rows[0]
-            raise ValueError(f'没有匹配的完整采集，请核对原始目录层级：{example["relative_dir"]} 缺少 '+', '.join(example['missing']))
+                         'capture_id': entry['capture_id'], **check_frame(s, m, declared_mode)})
         with self.lock:
             self.idle()
+            excluded = self.settings.get('skipped_frames', {}).get(self.exclusion_key(source, seg), [])
+            for row in rows: row['excluded'] = row['relative_dir'] in excluded
             changed = self.source != source or self.segmentation != seg
             self.source, self.segmentation, self.rows = source, seg, rows
             self.dataset_id = secrets.token_hex(12)
@@ -218,7 +320,7 @@ class Workspace:
                     self.results_match_inputs = False
                     break
             self.last_output = root
-            self.job = None
+            self.job = saved_job(root)
             self.dataset_id = secrets.token_hex(12)
             if remember:
                 self.settings['results'] = str(root)
@@ -263,8 +365,10 @@ class Workspace:
                 raise ValueError('成果文件夹已存在，请换一个名称，避免覆盖已有文件')
             allow_draft = payload.get('allow_draft') is True
             if mode == 'generate':
-                usable = [r for r in rows if not r['missing'] and r.get('decision') != 'reject' and (allow_draft or r['reviewed'])]
-                if not usable: raise ValueError('所选采集中没有可生成项；请确认分割，或勾选“允许初稿预览”，并检查缺失文件')
+                usable = [r for r in rows if not r['missing'] and not r.get('validation_errors')
+                          and not r.get('excluded') and r.get('decision') != 'reject'
+                          and (allow_draft or r['reviewed'])]
+                if not usable: raise ValueError('所选采集中没有可生成项；请查看核对失败或跳过标记，确认分割或勾选“允许初稿预览”')
             elif mode == 'export':
                 if any(r['relative_dir'] not in self.results for r in rows):
                     raise ValueError('导出范围含未生成采集，请改选“已生成”范围或先生成点云')
@@ -297,6 +401,10 @@ class Workspace:
                 with self.lock: self.job['current'] = rel
                 try:
                     if mode == 'generate':
+                        if row.get('excluded'):
+                            raise SkipCapture('工作台手动标记为跳过')
+                        if row.get('validation_errors'):
+                            raise SkipCapture('核对失败：'+'；'.join(row['validation_errors']))
                         # Re-read review state in reconstruct; old list never authorizes a changed mask.
                         meta = read_json(within(self.segmentation, rel)/'segmentation.json')
                         if meta.get('decision') == 'reject':
@@ -326,8 +434,10 @@ class Workspace:
                         if (dest/other).exists(): (dest/other).unlink()
                         if normalized != report:
                             write_json(dest/'pointcloud.json', normalized)
-                            with np.load(dest/'points.npz', allow_pickle=False) as data:
-                                write_viewer(dest/'preview.html', data, normalized)
+                        # Folder exports use the current layout/theme even when
+                        # the measured point data and metadata need no upgrade.
+                        with np.load(dest/'points.npz', allow_pickle=False) as data:
+                            write_viewer(dest/'preview.html', data, normalized)
                         report = normalized
                     completed.append((row, report))
                     with self.lock: self.job['success'] += 1
@@ -338,6 +448,12 @@ class Workspace:
                     bad = within(stage, rel)
                     if bad.exists(): shutil.rmtree(bad)
                     with self.lock: self.job['errors'].append({'relative_dir': rel, 'error': str(exc)})
+                    if mode == 'generate':
+                        with self.lock:
+                            for original in self.rows:
+                                if original['id'] == row['id']:
+                                    original['validation_status'] = 'failed'
+                                    original['validation_errors'] = ['生成核对失败：'+str(exc)]
                 finally:
                     with self.lock: self.job['done'] += 1
             if not completed:
@@ -352,6 +468,8 @@ class Workspace:
                                     'primary_ply': primary_ply(report), 'camera': report.get('camera', {}),
                                     'reviewed': report['reviewed'], 'points': report['stats']['points']} for row, report in completed]}
             write_json(stage/'pointcloud_dataset.json', manifest)
+            if mode == 'generate':
+                write_json(stage/'input_validation.json', self.validation_report())
             final_job = {**copy.deepcopy(self.job), 'status': status, 'current': '已按原相对目录保存全部成果'}
             write_json(stage/'export.json', final_job)
             links = ''.join(f'<li><a href="{quote(row["relative_dir"], safe="/")}/preview.html">{escape(row["relative_dir"])}</a> · {report["stats"]["points"]:,} 点</li>' for row, report in completed)

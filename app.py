@@ -67,6 +67,11 @@ def make_handler(workspace, token):
                 elif url.path == '/api/state': self.send(workspace.state())
                 elif url.path == '/api/job':
                     with workspace.lock: self.send({'job': workspace.job})
+                elif url.path == '/api/validation':
+                    with workspace.lock:
+                        if q.get('dataset_id', [''])[0] != workspace.dataset_id:
+                            raise ValueError('目录已切换，请重新载入核对记录')
+                        self.send(workspace.validation_report())
                 elif url.path == '/api/media':
                     with workspace.lock:
                         if q.get('dataset_id', [''])[0] != workspace.dataset_id:
@@ -116,6 +121,7 @@ def make_handler(workspace, token):
                     self.send(choose_directory(payload.get('path'), payload.get('title', '选择文件夹')))
                 elif self.path == '/api/load': self.send(workspace.load(payload))
                 elif self.path == '/api/open_results': self.send(workspace.open_results(payload.get('path')))
+                elif self.path == '/api/mark_skipped': self.send(workspace.mark_skipped(payload))
                 elif self.path == '/api/generate': self.send(workspace.start(payload, 'generate'))
                 elif self.path == '/api/export': self.send(workspace.start(payload, 'export'))
                 elif self.path == '/api/stop': self.send(workspace.stop())

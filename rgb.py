@@ -5,6 +5,7 @@ import sys
 from .core import (VERSION, Image, np, cv2, source_files, sha256, choose_mask, read_json,
                    backproject, project, discontinuities, camera_identity, export_metadata)
 from segmentation_workbench.geometry import prepare_frame, validate_mask_region, RGB_VERSION
+from .registration import rgb_timing, depth_to_color, audit_rgb_registration
 
 
 def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, visibility_mm):
@@ -13,6 +14,10 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
         raise ValueError('该 RGB 分割未记录已核对的对齐深度几何；请用当前分割工作台新建 RGB 任务')
     mask_path, mask, reviewed = choose_mask(segmentation, meta, allow_draft)
     used = source_files(meta)
+    # Native depth is used only as an independent check of the saved SDK align.
+    # Include it in provenance and in the final immutability check when present.
+    if (source/'depth_sensor_code_u16.npy').is_file():
+        used.add('depth_sensor_code_u16.npy')
     hashes = {name:sha256(source/name) for name in used}
     mask_hash, meta_hash = sha256(mask_path), sha256(segmentation/'segmentation.json')
     expected = meta.get('source_sha256', {})
@@ -33,6 +38,9 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
     if depth_mm.dtype != np.uint16 or not np.array_equal(depth_mm, expected_mm):
         raise ValueError('对齐深度码与分割使用的毫米数组不一致')
     record = read_json(source/'reconstruction.json')
+    # The RGB mask selects geometry, so an unsynchronized RGB frame cannot be
+    # handled by merely disabling colors (which is valid only for the IR path).
+    dt = rgb_timing(record, max_rgb_delta_us)
     props = record.get('runtime', {}).get('device_properties_at_session_start', {})
     for name in ['depth_mirror', 'depth_flip', 'color_mirror', 'color_flip']:
         if props.get(name, {}).get('value') is not False:
@@ -47,15 +55,8 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
     color_points = color_xyz[selected]
     # Preserve the workbench's original depth-camera origin. Alignment has already
     # occurred: do not apply depth_to_color to these color-frame points again.
-    ext = record['actual_profile_extrinsics']['depth_to_color']
-    rotation = np.asarray(ext['rotation_row_major'], float).reshape(3, 3)
-    translation = np.asarray(ext['translation_mm'], float)
-    if translation.shape != (3,) or not np.isfinite(rotation).all() or not np.isfinite(translation).all():
-        raise ValueError('深度到 RGB 外参尺寸或数值无效')
-    orthogonality = float(np.linalg.norm(rotation.T@rotation-np.eye(3)))
-    determinant = float(np.linalg.det(rotation))
-    if orthogonality > .05 or abs(determinant-1) > .05:
-        raise ValueError('深度到 RGB 外参不是可用的相机旋转，无法保持原始深度相机坐标')
+    rotation, translation, orthogonality, determinant = depth_to_color(record)
+    registration = audit_rgb_registration(source, record, geometry, mask, codes, scale)
     points = np.linalg.solve(rotation, (color_points-translation).T).T.astype(np.float32)
     if not np.isfinite(points).all():
         raise ValueError('转换到原始深度相机坐标产生无效点')
@@ -63,9 +64,6 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
     with Image.open(source/'color.png') as im:
         width, height = im.size
     rgb_valid = np.isfinite(rgb_uv).all(axis=1) & (rgb_uv[:,0] >= 0) & (rgb_uv[:,0] <= width-1) & (rgb_uv[:,1] >= 0) & (rgb_uv[:,1] <= height-1)
-    dt = int(record['selected_capture']['timestamp_deltas']['color_minus_depth_device_us'])
-    if abs(dt) > max_rgb_delta_us:
-        rgb_valid[:] = False
     rgb = image[selected].copy()
     rgb[~rgb_valid] = 0
     edges = discontinuities(codes.astype(float)*scale)[selected]
@@ -74,7 +72,8 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
                 '毫米尺度来自记录的标定，实际尺寸误差仍需实物验证',
                 '本路径未关联原始红外强度；IR 属性为缺失值，不生成 IR PLY']
     if not reviewed: warnings.insert(0, '未审核分割初稿，仅供流程预览，不作为合格躯干测量或训练样本')
-    if abs(dt) > max_rgb_delta_us: warnings.append('RGB 与深度不同步，保留几何但不使用 RGB 配色')
+    warnings.extend(registration['warnings'])
+    warnings.append('配准交叉核对只验证采集记录的几何一致性，未用标定板重估内外参，不能替代实物尺寸精度验证')
     if orthogonality > .001: warnings.append('记录的相机旋转矩阵轻微非正交，使用原矩阵求逆并记录误差')
     if fg[0].any() or fg[-1].any() or fg[:,0].any() or fg[:,-1].any():
         warnings.append('掩码触及图像边界，检查出画／截断')
@@ -89,6 +88,7 @@ def reconstruct_rgb(source, segmentation, meta, allow_draft, max_rgb_delta_us, v
               'reviewed':reviewed, 'segmentation_status':meta.get('status'),
               'segmentation_revision':meta.get('revision'), 'mask_file':mask_path.name,
               'input_mode':'rgb', 'camera':camera_identity(record), 'geometry_id':geometry['geometry_id'],
+              'rgb_registration':registration,
               'pixel_coordinate_space':'aligned_color', 'depth_value_frame':'color',
               'coordinate_system':'native_depth_camera', 'unit':'mm',
               'axes':{'X':'right','Y':'down','Z':'forward (axial depth)'},
