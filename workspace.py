@@ -54,6 +54,14 @@ def cloud_review_record(result, relative_dir, decision):
             'reviewed_at': datetime.now().astimezone().isoformat()}
 
 
+def capture_input_mode(meta, expected):
+    mode = input_mode(meta)
+    if expected and mode != expected:
+        labels = {'rgb': 'RGB', 'infrared': 'IR'}
+        raise ValueError(f'分割清单与逐帧输入模式不一致（清单：{labels[expected]}，采集：{labels[mode]}）')
+    return mode
+
+
 def atomic_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,8 +127,10 @@ def check_frame(source, segmentation, declared_mode):
         try:
             mode = input_mode(meta)
             if declared_mode and mode != declared_mode:
-                errors.append(f'分割清单与逐帧输入模式不一致（清单 {declared_mode}，逐帧 {mode}）')
+                labels = {'rgb': 'RGB', 'infrared': 'IR'}
+                errors.append(f'分割清单与逐帧输入模式不一致（清单：{labels[declared_mode]}，采集：{labels[mode]}）')
         except (ValueError, TypeError) as exc:
+            mode = 'unknown'
             errors.append(str(exc))
     # Use the declared mode only to report missing files when metadata is absent.
     # The validation error above always blocks reconstruction of that frame.
@@ -181,11 +191,14 @@ class Workspace:
         self.job = None
         self.dataset_id = secrets.token_hex(12)
         self.rows = []
+        self.dataset_input_mode = None
         self.results = {}
         self.results_match_inputs = True
         self.source = self.segmentation = self.results_root = None
         self.last_output = None
         self.warning = ''
+        self.input_warning = ''
+        self.results_warning = ''
         self.settings = {}
         self.alignment = AlignmentService(self)
         settings_file = self.state_dir/'settings.json'
@@ -211,7 +224,8 @@ class Workspace:
                 source = source or read_json(Path(seg)/'dataset.json').get('source')
                 self.load({'source': str(source), 'segmentation': str(seg)}, remember=False)
             except (ValueError, OSError, KeyError, TypeError) as exc:
-                self.warning = f'未恢复输入目录：{exc}'
+                self.input_warning = f'未恢复输入目录：{exc}'
+                self.warning = self.input_warning
         results = initial_results or self.settings.get('results')
         if results:
             try:
@@ -318,7 +332,7 @@ class Workspace:
                     'alignment_source': self.settings.get('alignment_sources', {}).get(str(self.results_root), '') or str(self.source or self.settings.get('source', '')),
                     'export_parent': self.settings.get('export_parent', str(Path(__file__).resolve().parents[1]/'outputs')),
                     'suggested_name': '点云成果_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:19],
-                    'job': copy.deepcopy(self.job), 'warning': self.warning,
+                    'job': copy.deepcopy(self.job), 'warning': self.warning, 'input_warning': self.input_warning,
                     'validation': self.validation_report()['summary']}
 
     def load(self, payload, remember=True):
@@ -347,6 +361,7 @@ class Workspace:
             for row in rows: row['excluded'] = row['relative_dir'] in excluded
             changed = self.source != source or self.segmentation != seg
             self.source, self.segmentation, self.rows = source, seg, rows
+            self.dataset_input_mode = declared_mode
             self.dataset_id = secrets.token_hex(12)
             # A validated reload starts a fresh workspace, even when paths are unchanged.
             # Keep failures visible until this succeeds; active jobs remain protected by idle().
@@ -356,6 +371,7 @@ class Workspace:
                 self.results, self.results_root, self.last_output = {}, None, None
             self.results_match_inputs = True
             self.warning = ''
+            self.input_warning = ''
             if remember:
                 self.settings.update(source=str(source), segmentation=str(seg))
                 if not self.results_root: self.settings.pop('results', None)
@@ -455,12 +471,21 @@ class Workspace:
                 if not meta_path or not meta_path.is_file() or sha256(meta_path) != result['report'].get('segmentation_json_sha256'):
                     self.results_match_inputs = False
                     break
+            # Replace diagnostics for the previously opened results, while keeping
+            # unrelated configuration warnings and input diagnostics separate.
+            if self.results_warning and self.warning.endswith(self.results_warning):
+                self.warning = self.warning[:-len(self.results_warning)].strip()
+            # Viewing saved results does not require restored input directories.
+            # Input diagnostics remain available in directory settings.
+            if self.warning.startswith(('未恢复点云目录：', '未恢复输入目录：')):
+                self.warning = ''
             self.last_output = root
             self.job = saved_job(root)
             self.dataset_id = secrets.token_hex(12)
-            self.warning = f'{invalid} 次已保存对齐成果缺失或与原点云不匹配，已退回相机点云，请重新对齐。' if invalid else ''
+            self.results_warning = f'{invalid} 次已保存对齐成果缺失或与原点云不匹配，已退回相机点云，请重新对齐。' if invalid else ''
             if review_invalid:
-                self.warning += f' {review_invalid} 次点云筛选记录与当前文件不匹配，已恢复为待定。'
+                self.results_warning += f' {review_invalid} 次点云筛选记录与当前文件不匹配，已恢复为待定。'
+            self.warning = ' '.join(filter(None, [self.warning, self.results_warning.strip()]))
             if remember:
                 self.settings['results'] = str(root)
                 self.remember()
@@ -591,6 +616,15 @@ class Workspace:
                             raise SkipCapture('核对失败：'+'；'.join(row['validation_errors']))
                         # Re-read review state in reconstruct; old list never authorizes a changed mask.
                         meta = read_json(within(self.segmentation, rel)/'segmentation.json')
+                        try:
+                            capture_input_mode(meta, self.dataset_input_mode)
+                        except ValueError as exc:
+                            with self.lock:
+                                row['validation_errors'] = [str(exc)]
+                                for loaded_row in self.rows:
+                                    if loaded_row['id'] == row['id']:
+                                        loaded_row['validation_errors'] = list(row['validation_errors'])
+                            raise SkipCapture(str(exc)) from exc
                         if meta.get('decision') == 'reject':
                             raise SkipCapture('分割阶段标记为淘汰')
                         if not allow_draft and not (meta.get('reviewed') is True and meta.get('status') == 'reviewed'):

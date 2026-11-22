@@ -450,4 +450,153 @@ test('late confirmation response cannot move a capture the user has since select
   finish({...dataset,frames:[{...frames[0],has_alignment:true},frames[1]],clouds:2,results:'/clouds'});await save;
   assert.equal(ui.run('current'),'2');
   assert.equal(ui.run('pendingAdvance'),null);
+
+});
+
+const mixedFrames = () => [
+  frame('itof-ir',{has_cloud:true,points:100,cloud_camera:{type:'itof'},cloud_input_mode:'infrared'}),
+  frame('stereo-ir',{has_cloud:true,points:100,cloud_camera:{type:'stereo'},cloud_input_mode:'infrared'}),
+  frame('stereo-rgb',{has_cloud:true,points:100,cloud_camera:{type:'stereo'},cloud_input_mode:'rgb'}),
+  frame('itof-rgb',{has_cloud:true,points:100,cloud_camera:{type:'itof'},cloud_input_mode:'rgb'})
+];
+
+test('camera and segmentation filters combine and move preview to a matching capture', async () => {
+  const ui=await setup({...dataset,frames:mixedFrames(),clouds:4,results:'/clouds'});
+  assert.equal(ui.elements.get('cameraFilter').children.find(r=>r.value==='itof').textContent,'iToF（2）');
+  assert.equal(ui.elements.get('cameraFilter').children.find(r=>r.value==='stereo').textContent,'双目（2）');
+  assert.equal(ui.elements.get('modeFilter').children.find(r=>r.value==='rgb').textContent,'RGB 分割（2）');
+  ui.elements.get('cameraFilter').value='stereo';
+  ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['stereo-ir','stereo-rgb']);
+  assert.equal(ui.run('current'),'stereo-ir');
+  assert.match(ui.elements.get('currentTitle').textContent,/双目 · IR 分割/);
+  assert.equal(ui.run('selected.size'),4);
+  assert.match(ui.elements.get('selectedCount').textContent,/隐藏 2/);
+  ui.elements.get('modeFilter').value='rgb';
+  ui.elements.get('modeFilter').onchange();
+  assert.equal(ui.run('current'),'stereo-rgb');
+  assert.match(ui.elements.get('currentTitle').textContent,/双目 · RGB 分割/);
+  const chips=ui.elements.get('frames').children[0].children[1].children[2].textContent;
+  assert.match(chips,/双目 · RGB 分割/);
+  ui.run('selected.clear(); controls();');
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['stereo-rgb']);
+  ui.elements.get('selectAll').checked=false;
+  ui.elements.get('selectAll').onchange();
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['stereo-rgb']);
+});
+
+test('filtering no matches clears the old preview and reports an empty list', async () => {
+  const ui=await setup({...dataset,frames:mixedFrames(),clouds:4,results:'/clouds'});
+  ui.run('selected.clear();');
+  ui.elements.get('search').value='no-such-pig';
+  ui.elements.get('search').listeners.input();
+  assert.equal(ui.elements.get('viewer').hidden,true);
+  assert.match(ui.elements.get('frames').children[0].textContent,/没有符合筛选/);
+  assert.match(ui.elements.get('currentTitle').textContent,/没有符合筛选/);
+  assert.equal(ui.elements.get('generate').disabled,true);
+  assert.equal(ui.elements.get('exportCurrent').disabled,true);
+});
+
+test('camera labels come from capture metadata, and missing metadata stays unknown', async () => {
+  const rows=[frame('1',{relative_dir:'itof-results/stereo-capture',camera:{type:'stereo'},input_mode:'rgb'}),
+    frame('2',{relative_dir:'itof-results/unknown-capture'})];
+  const ui=await setup({...dataset,frames:rows});
+  assert.match(ui.elements.get('currentTitle').textContent,/双目 · RGB 分割/);
+  ui.elements.get('cameraFilter').value='unknown';
+  ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['2']);
+  assert.match(ui.elements.get('currentTitle').textContent,/相机待识别/);
+});
+
+test('read-only results hide input setup hints and retain the generation reason in the button title', async () => {
+  const ui=await setup({...dataset,source:'',segmentation:'',frames:mixedFrames(),clouds:4,
+    results:'/clouds',results_match_inputs:false});
+  assert.equal(ui.elements.get('generationHint').hidden,true);
+  assert.equal(ui.elements.get('generate').disabled,true);
+  assert.match(ui.elements.get('generate').title,/目录设置/);
+});
+
+
+test('opening valid results replaces the stale restoration warning in the page', async () => {
+  const warning='未恢复点云目录：文件夹不存在：/old-results';
+  const ui=await setup({...dataset,warning});
+  assert.equal(ui.elements.get('message').textContent,warning);
+  const opened={...dataset,warning:'',results:'/new-results',clouds:1,
+    frames:[frame('1',{has_cloud:true,points:100,cloud_camera:{type:'stereo'},cloud_input_mode:'infrared'})]};
+  ui.sandbox.reply=async url=>url==='/api/choose_directory' ? {path:'/new-results'} : opened;
+  await ui.elements.get('openResults').onclick();
+  assert.equal(ui.elements.get('message').textContent,'');
+  assert.equal(ui.elements.get('viewer').hidden,false);
+  assert.equal(ui.run('state.results'),'/new-results');
+});
+
+
+test('viewing results keeps stale input restoration warnings inside directory settings', async () => {
+  for (const initialClouds of [0,1]) {
+    const warning='未恢复输入目录：文件夹不存在：/old-segmentation';
+    const initial={...dataset,source:'',segmentation:'',warning,clouds:initialClouds,
+      results:initialClouds ? '/clouds' : '',
+      frames:initialClouds ? [frame('1',{has_cloud:true,points:100})] : dataset.frames};
+    const ui=await setup(initial);
+    assert.equal(ui.elements.get('message').textContent,initialClouds ? '' : warning);
+    // Emulate the existing server, which still returns the stale startup warning.
+    ui.sandbox.reply=async url=>url==='/api/choose_directory' ? {path:'/clouds'} : {
+      ...initial,clouds:1,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100})]};
+    await ui.elements.get('openResults').onclick();
+    assert.equal(ui.elements.get('message').textContent,'');
+    assert.equal(ui.elements.get('viewer').hidden,false);
+    assert.equal(ui.elements.get('generate').disabled,true);
+    ui.elements.get('configure').onclick();
+    assert.equal(ui.elements.get('directoryMessage').textContent,warning);
+  }
+});
+
+test('opening a missing results folder still displays the current error', async () => {
+  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100})]});
+  ui.sandbox.reply=async url=>{
+    if (url==='/api/choose_directory') return {path:'/missing-results'};
+    throw new Error('文件夹不存在：/missing-results');
+  };
+  await ui.elements.get('openResults').onclick();
+  assert.equal(ui.elements.get('message').textContent,'文件夹不存在：/missing-results');
+  assert.equal(ui.run('state.results'),'/clouds');
+});
+
+
+test('mode mismatches remain visible and are submitted for recorded skips while good captures generate', async () => {
+  const bad=frame('bad', {input_mode:'infrared', validation_errors:['分割清单与逐帧输入模式不一致（清单：RGB，采集：IR）']});
+  const ui=await setup({...dataset, frames:[bad, frame('good')], reviewed:2});
+  assert.equal(ui.elements.get('generate').disabled,false);
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['good']);
+  ui.run("selected = new Set(['bad','good']); controls();");
+  assert.match(ui.elements.get('generationHint').textContent,/核对失败 1 次.*自动跳过/);
+  const first=ui.elements.get('frames').children[0];
+  assert.match(first.title,/清单：RGB，采集：IR/);
+  assert.match(first.children[1].children[2].textContent,/核对失败.*自动跳过/);
+  assert.match(first.children[1].children[3].textContent,/输入模式不一致/);
+  await ui.elements.get('generate').onclick();
+  assert.deepEqual(ui.requests.find(r=>r.url==='/api/generate').payload.ids,['bad','good']);
+  ui.run("selected = new Set(['bad']); controls();");
+  assert.equal(ui.elements.get('generate').disabled,true);
+  assert.match(ui.elements.get('generationHint').textContent,/核对结果/);
+  ui.run("selected = new Set(['bad','good']); controls();");
+  assert.equal(ui.elements.get('generate').disabled,false);
+});
+
+test('invalid capture filter exposes mode mismatches without enabling reconstruction', async () => {
+  const bad=frame('bad', {validation_errors:['分割清单与逐帧输入模式不一致']});
+  const ui=await setup({...dataset, frames:[bad, frame('good')]});
+  ui.elements.get('filter').value='failed';
+  ui.elements.get('filter').listeners.input();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['bad']);
+  assert.equal(ui.elements.get('generate').disabled,true);
+});
+
+test('loading mixed inputs reports marked captures and keeps generation available', async () => {
+  const ui=await setup();
+  const mixed={...dataset, frames:[frame('good'),frame('bad', {validation_errors:['输入模式不一致']})]};
+  ui.sandbox.reply=async()=>clone(mixed);
+  await ui.elements.get('finishDirectories').onclick();
+  assert.match(ui.elements.get('message').textContent,/通过 1 次.*失败 1 次.*自动跳过/);
+  assert.equal(ui.elements.get('generate').disabled,false);
 });

@@ -96,6 +96,30 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(len(self.ws.job['skipped']),1)
         self.assertFalse((self.root/'generated').exists())
 
+    def test_mixed_camera_metadata_survives_generation_and_opening_results(self):
+        other_rel = 'another_camera/pig_test/capture'
+        shutil.copytree(self.source/self.rel, self.source/other_rel)
+        shutil.copytree(self.seg/self.rel, self.seg/other_rel)
+        for rel, name in [(self.rel, 'Orbbec Femto Bolt'), (other_rel, 'Orbbec Gemini 336L')]:
+            record = read_json(self.source/rel/'reconstruction.json')
+            record.setdefault('runtime', {})['device'] = {'name': name}
+            write_json(self.source/rel/'reconstruction.json', record)
+        ds = read_json(self.seg/'dataset.json')
+        ds['frames'].append({**ds['frames'][0], 'relative_dir': other_rel})
+        write_json(self.seg/'dataset.json', ds)
+        state = self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
+        self.assertEqual([r['camera']['type'] for r in state['frames']], ['itof', 'stereo'])
+        self.assertEqual({r['input_mode'] for r in state['frames']}, {'infrared'})
+        payload = self.payload(allow_draft=True)
+        payload['ids'] = [r['id'] for r in state['frames']]
+        self.ws.start(payload, 'generate')
+        self.ws.worker.join(10)
+        self.assertEqual(self.ws.job['status'], 'completed', self.ws.job)
+        fresh = Workspace(self.root/'fresh-settings')
+        opened = fresh.open_results(str(self.root/'generated'), remember=False)
+        self.assertEqual({r['cloud_camera']['type'] for r in opened['frames']}, {'itof', 'stereo'})
+        self.assertEqual({r['cloud_input_mode'] for r in opened['frames']}, {'infrared'})
+
     def test_foreign_settings_do_not_reuse_other_os_directories(self):
         foreign = '/Users/mac-user/data' if __import__('os').name == 'nt' else r'C:\Users\windows-user\data'
         settings = {key: foreign for key in ('source', 'segmentation', 'results', 'export_parent')}
@@ -269,6 +293,61 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(self.ws.state()['clouds'], 2)
         self.assertEqual(len(list((self.root/'stopped').rglob('points.npz'))), 1)
 
+    def test_open_results_clears_stale_restore_warning_and_remembers_new_path(self):
+        generated = self.generate()
+        state_dir = self.root/'stale-settings'
+        state_dir.mkdir()
+        old_results = self.root/'removed-results'
+        write_json(state_dir/'settings.json', {'results': str(old_results)})
+        restored = Workspace(state_dir)
+        self.assertIn('未恢复点云目录：', restored.warning)
+        self.assertIn(str(old_results), restored.warning)
+        old_warning = restored.warning
+        with self.assertRaisesRegex(ValueError, '文件夹不存在'):
+            restored.open_results(str(old_results))
+        self.assertEqual(restored.warning, old_warning)
+        state = restored.open_results(str(generated))
+        self.assertEqual(state['warning'], '')
+        self.assertEqual(state['clouds'], 1)
+        self.assertEqual(state['results'], str(generated))
+        self.assertEqual(read_json(state_dir/'settings.json')['results'], str(generated))
+        restarted = Workspace(state_dir).state()
+        self.assertEqual(restarted['warning'], '')
+        self.assertEqual(restarted['clouds'], 1)
+
+    def test_open_results_preserves_unrelated_warning(self):
+        generated = self.generate()
+        self.ws.warning = '其他需要检查的配置提醒'
+        state = self.ws.open_results(str(generated), remember=False)
+        self.assertEqual(state['warning'], '其他需要检查的配置提醒')
+        self.assertEqual(state['clouds'], 1)
+
+    def test_saved_results_open_without_original_or_segmentation_directories(self):
+        generated = self.generate()
+        state_dir = self.root/'results-only-settings'
+        state_dir.mkdir()
+        write_json(state_dir/'settings.json', {
+            'source': str(self.root/'removed-raw'),
+            'segmentation': str(self.root/'removed-segmentation'),
+            'results': str(generated)})
+        restored = Workspace(state_dir)
+        state = restored.state()
+        self.assertEqual(state['clouds'], 1)
+        self.assertEqual(state['warning'], '')
+        self.assertIn('未恢复输入目录：', state['input_warning'])
+        self.assertEqual(state['source'], '')
+        self.assertEqual(state['segmentation'], '')
+        state = restored.open_results(str(generated))
+        self.assertEqual(state['warning'], '')
+        self.assertEqual(state['clouds'], 1)
+        self.assertIn('未恢复输入目录：', state['input_warning'])
+        with self.assertRaisesRegex(ValueError, '文件夹不存在'):
+            restored.open_results(str(self.root/'missing-results'))
+        self.assertEqual(restored.state()['clouds'], 1)
+        # Reloading valid inputs clears the diagnostic in directory settings too.
+        state = restored.load({'source': str(self.source), 'segmentation': str(self.seg)})
+        self.assertEqual(state['input_warning'], '')
+
     def test_open_results_rejects_symlink_ancestor(self):
         generated = self.generate()
         other = self.root/'links'; other.mkdir()
@@ -285,6 +364,75 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn('输入模式不一致', state['frames'][0]['validation_errors'][0])
         with self.assertRaisesRegex(ValueError, '没有可生成项'):
             self.ws.start(self.payload(allow_draft=True), 'generate')
+
+    def test_mismatched_mode_is_marked_and_cannot_generate_even_with_draft_permission(self):
+        dataset = read_json(self.seg/'dataset.json')
+        dataset['input_mode'] = 'rgb'
+        write_json(self.seg/'dataset.json', dataset)
+        state = self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
+        row = state['frames'][0]
+        self.assertEqual(row['input_mode'], 'infrared')
+        self.assertIn('输入模式不一致', row['validation_errors'][0])
+        self.assertIn('清单：RGB，采集：IR', row['validation_errors'][0])
+        with self.assertRaisesRegex(ValueError, '核对失败'):
+            self.ws.start(self.payload(allow_draft=True), 'generate')
+        self.assertFalse((self.root/'generated').exists())
+
+    def test_bad_capture_is_skipped_and_normal_capture_still_generates(self):
+        good_rel = 'pig_normal/capture'
+        shutil.copytree(self.source/self.rel, self.source/good_rel)
+        shutil.copytree(self.seg/self.rel, self.seg/good_rel)
+        dataset = read_json(self.seg/'dataset.json')
+        dataset['input_mode'] = 'infrared'
+        dataset['frames'].append({**dataset['frames'][0], 'relative_dir': good_rel})
+        write_json(self.seg/'dataset.json', dataset)
+        meta_path = self.seg/self.rel/'segmentation.json'
+        original_meta = read_json(meta_path)
+        for after_load in (False, True):
+            with self.subTest(metadata_changed_after_load=after_load):
+                # A bad first record must not prevent the following valid record.
+                write_json(meta_path, original_meta if after_load else {**original_meta, 'input_mode': 'rgb'})
+                state = self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
+                self.assertEqual(bool(state['frames'][0]['validation_errors']), not after_load)
+                self.assertEqual(state['frames'][1]['validation_errors'], [])
+                if after_load:
+                    write_json(meta_path, {**original_meta, 'input_mode': 'rgb'})
+                name = 'after-load' if after_load else 'marked-at-load'
+                payload = self.payload(name, allow_draft=True)
+                payload['ids'] = [r['id'] for r in state['frames']]
+                self.ws.start(payload, 'generate')
+                self.ws.worker.join(10)
+                job = self.ws.job
+                self.assertEqual(job['status'], 'completed', job)
+                self.assertEqual((job['done'], job['total'], job['success']), (2, 2, 1))
+                self.assertEqual(job['errors'], [])
+                self.assertEqual(len(job['skipped']), 1)
+                self.assertEqual(job['skipped'][0]['relative_dir'], self.rel)
+                self.assertIn('输入模式不一致', job['skipped'][0]['reason'])
+                self.assertTrue(self.ws.state()['frames'][0]['validation_errors'])
+                output = self.root/name
+                self.assertFalse((output/self.rel).exists())
+                self.assertTrue((output/good_rel/'points.npz').is_file())
+                saved = read_json(output/'pointcloud_dataset.json')
+                self.assertEqual([r['relative_dir'] for r in saved['frames']], [good_rel])
+                self.assertEqual(read_json(output/'export.json')['skipped'], job['skipped'])
+        # Correcting the metadata and reloading removes the marker.
+        write_json(meta_path, original_meta)
+        state = self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
+        self.assertEqual(state['frames'][0]['validation_errors'], [])
+
+    def test_unknown_frame_mode_is_marked_but_unknown_manifest_mode_is_rejected(self):
+        meta_path = self.seg/self.rel/'segmentation.json'
+        meta = read_json(meta_path)
+        write_json(meta_path, {**meta, 'input_mode': 'unsupported'})
+        state = self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
+        self.assertEqual(state['frames'][0]['input_mode'], 'unknown')
+        self.assertIn('未知分割输入模式', state['frames'][0]['validation_errors'][0])
+        dataset = read_json(self.seg/'dataset.json')
+        dataset['input_mode'] = 'unsupported'
+        write_json(self.seg/'dataset.json', dataset)
+        with self.assertRaisesRegex(ValueError, '未知分割输入模式'):
+            self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
 
     def test_open_other_segmentation_results_cannot_generate_from_current_inputs(self):
         generated=self.generate()

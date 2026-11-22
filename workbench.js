@@ -20,6 +20,11 @@ const cloudDecision = row => row.cloud_decision || 'pending';
 const message = (text = '', error = false) => {
   for (const id of ['message', 'directoryMessage']) { $(id).textContent = text; $(id).title = text; $(id).classList.toggle('error', error); }
 };
+function workspaceWarning() {
+  const warning = state?.warning || '';
+  // Also handle an already-running server that still returns startup diagnostics.
+  return state?.clouds && /^未恢复(?:输入|点云)目录：/.test(warning) ? '' : warning;
+}
 async function api(path, payload, retry = true) {
   const response = await fetch('/api/' + path, payload === undefined ? {} : {
     method: 'POST', headers: {'Content-Type': 'application/json', 'X-App-Token': appToken}, body: JSON.stringify(payload)
@@ -61,7 +66,8 @@ function accept(data, paths = false, preserveCurrent = false) {
   if (first || changedResults) $('coordinateFrame').value = state.frames.find(r => r.id === current)?.has_alignment ? 'body' : 'camera';
   render(preserveCurrent);
   if (first || paths || previousCurrent !== current) document.querySelector('.frame.active')?.scrollIntoView({block:'nearest'});
-  if (state.warning) message(state.warning, true);
+  const warning = workspaceWarning();
+  message(warning, !!warning);
   if (running()) schedulePoll();
 }
 function renderFilters() {
@@ -125,8 +131,17 @@ function renderList() {
     item.title = row.relative_dir + (row.validation_errors?.length ? '\n'+row.validation_errors.join('\n') :
       row.missing.length ? '\n缺少：'+row.missing.join('、') : '');
     button.append(title, capture, chips); button.disabled = alignmentBusy;
+    if (row.validation_errors?.length) {
+      const reason = document.createElement('span'); reason.className = 'capture issue';
+      reason.textContent = row.validation_errors.join('；'); button.append(reason);
+    }
     button.onclick = () => selectCapture(row.id);
     item.append(check, button); $('frames').append(item);
+  }
+  if (!rows.length) {
+    const empty = document.createElement('p'); empty.className = 'muted';
+    empty.textContent = '没有符合筛选条件的采集，请调整相机类型、分割来源或搜索条件。';
+    $('frames').append(empty);
   }
   const visibleIds = new Set(rows.map(r => r.id)), hiddenSelection = [...selected].filter(id => !visibleIds.has(id)).length;
   $('selectedCount').textContent = `已勾选 ${selected.size}` + (hiddenSelection ? ` · 隐藏 ${hiddenSelection}` : '');
@@ -154,7 +169,7 @@ function renderViewer() {
   const camera = row ? cameraLabel(row) : '';
   const mode = row?.cloud_input_mode || row?.input_mode;
   $('currentTitle').textContent = row ? [camera,mode === 'rgb' ? 'RGB 分割' : mode === 'infrared' ? 'IR 分割' : '',
-    `${row.pig_id} / ${row.capture_id}`].filter(Boolean).join(' · ') : '选择一次采集查看点云';
+    `${row.pig_id} / ${row.capture_id}`].filter(Boolean).join(' · ') : (state.frames.length && !visibleRows().length ? '没有符合筛选条件的采集' : '选择一次采集查看点云');
   $('currentTitle').title = $('currentTitle').textContent;
   $('currentTag').hidden = !row?.has_cloud;
   if (row?.has_cloud) {
@@ -238,6 +253,7 @@ function controls() {
   $('generate').title = plan.error || plan.hint;
   $('generationHint').textContent = running() ? '任务处理中，请等待完成或停止后重新选择目录。' : plan.error || plan.hint;
   $('generationHint').title = $('generationHint').textContent;
+  $('generationHint').hidden = running() || !!(state?.clouds && !dirty());
   $('export').disabled = locked || !state?.clouds;
   $('export').title = '选择导出内容、采集范围与保存目录，统一保存点云和筛选记录';
   $('exportCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud;
@@ -318,7 +334,7 @@ async function poll() {
       if (state.dataset_id !== datasetId || state.job?.id !== jobId) return;
       accept(fresh);
       if (job?.success) { $('name').value = state.suggested_name; controls(); }
-      message(job?.error || (job?.success ? `已保存 ${job.success} 次采集：${job.output}` : '任务已停止'), job?.status === 'failed');
+      message(job?.error || job?.warning || workspaceWarning(), !!(job?.error || workspaceWarning()));
     }
   } catch(e) {
     if (state.dataset_id !== datasetId || state.job?.id !== jobId) return;
@@ -335,6 +351,12 @@ async function choose(field, title) {
 document.querySelectorAll('.browse').forEach(button => button.onclick = () => action(() => choose(button.dataset.field,
   {source:'选择原始采集根目录', segmentation:'选择分割结果根目录', parent:'选择点云导出目录'}[button.dataset.field])));
 function openDirectories(field) {
+  const inputWarning = state?.input_warning || (state?.warning?.startsWith('未恢复输入目录：') ? state.warning : '');
+  if (inputWarning) {
+    $('directoryMessage').textContent = inputWarning;
+    $('directoryMessage').title = inputWarning;
+    $('directoryMessage').classList.add('error');
+  }
   $('directoryDialog').showModal();
   if (field) $(field).focus();
 }
@@ -345,7 +367,7 @@ $('openResults').onclick = () => action(async () => {
   message('系统文件夹窗口已打开，请选择已有点云成果根目录。');
   const result = await api('choose_directory', {path: state.results || $('parent').value, title:'打开已有点云成果目录'});
   if (result.cancelled) { message('已取消选择。'); return; }
-  accept(await api('open_results', {path: result.path})); message('已载入点云目录：' + result.path);
+  accept(await api('open_results', {path: result.path}));
 });
 async function loadDirectories(close = false) {
   accept(await api('load', {source:$('source').value.trim(), segmentation:$('segmentation').value.trim()}), true);

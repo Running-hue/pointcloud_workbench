@@ -10,6 +10,7 @@ from pathlib import Path
 import secrets
 import subprocess
 import sys
+import threading
 from urllib.parse import parse_qs, urlparse, urlencode
 import webbrowser
 
@@ -19,11 +20,16 @@ from pointcloud_workbench.workspace import Workspace, RESULT_FILES
 from pointcloud_workbench.viewer import render_viewer
 from pointcloud_workbench.alignment import render_body_view
 from pointcloud_workbench.core import np, read_json
+from pointcloud_workbench.startup import APP_ID, source_revision, reuse_server
 
 APP_DIR = Path(__file__).resolve().parent
 
 
 def make_handler(workspace, token):
+    # Capture the loaded code version once; disk files may change while this process runs.
+    revision = source_revision()
+    active_posts = 0
+    shutting_down = False
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -65,6 +71,9 @@ def make_handler(workspace, token):
                         self.send({'error': '不支持跨站请求'}, status=403)
                         return
                     self.send({'token': token})
+                elif url.path == '/api/runtime':
+                    self.send({'app': APP_ID, 'revision': revision, 'root': str(APP_DIR),
+                               'state_dir': str(workspace.state_dir)})
                 elif url.path == '/api/state': self.send(workspace.state())
                 elif url.path == '/api/job':
                     with workspace.lock: self.send({'job': workspace.job})
@@ -110,6 +119,8 @@ def make_handler(workspace, token):
                 self.send({'error': str(exc)}, status=400)
 
         def do_POST(self):
+            nonlocal active_posts, shutting_down
+            registered = False
             try:
                 if not self.authorized_host():
                     self.send({'error': '请从本机点云工作台操作'}, status=403)
@@ -124,7 +135,22 @@ def make_handler(workspace, token):
                 if not 0 < length <= 1_000_000 or not self.headers.get('Content-Type', '').startswith('application/json'):
                     raise ValueError('需要有效的 JSON 请求')
                 payload = json.loads(self.rfile.read(length))
-                if self.path == '/api/choose_directory':
+                with workspace.lock:
+                    if shutting_down:
+                        raise ValueError('工作台正在更新重启，请稍后刷新页面')
+                    active_posts += 1
+                    registered = True
+                if self.path == '/api/shutdown':
+                    with workspace.lock:
+                        if payload.get('revision') != revision:
+                            raise ValueError('服务版本已变化，请重新启动')
+                        workspace.idle()
+                        if active_posts != 1 or workspace.worker and workspace.worker.is_alive():
+                            raise ValueError('工作台正在处理操作，请等待完成')
+                        shutting_down = True
+                    self.send({'status': 'restarting'})
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+                elif self.path == '/api/choose_directory':
                     from pointcloud_workbench.native_picker import choose_directory
                     self.send(choose_directory(payload.get('path'), payload.get('title', '选择文件夹')))
                 elif self.path == '/api/load': self.send(workspace.load(payload))
@@ -150,6 +176,10 @@ def make_handler(workspace, token):
                 self.send({'error': str(exc)}, status=400)
             except Exception as exc:
                 self.send({'error': f'操作失败：{exc}'}, status=500)
+            finally:
+                if registered:
+                    with workspace.lock:
+                        active_posts -= 1
     return Handler
 
 
@@ -161,6 +191,13 @@ def main():
     p.add_argument('--results', type=Path)
     p.add_argument('--open', action='store_true')
     args = p.parse_args()
+    if args.open and not (args.results or args.segmentation):
+        try:
+            if reuse_server(args.port, args.state, source_revision()):
+                webbrowser.open(f'http://127.0.0.1:{args.port}')
+                return
+        except (ValueError, OSError) as exc:
+            p.error(str(exc))
     first_run = not (args.state/'settings.json').is_file()
     seg = APP_DIR.parent/'outputs/itof_SAM2猪体分割'
     results = APP_DIR.parent/'outputs/itof_多模态毫米点云预览'
