@@ -1,0 +1,9 @@
+# macOS 文件夹显示信息
+.DS_Store
+
+# Python 运行缓存
+__pycache__/
+*.py[cod]
+
+# 本机目录设置、筛选状态和对齐缓存
+/.state/
