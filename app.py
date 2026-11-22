@@ -17,6 +17,7 @@ if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pointcloud_workbench.workspace import Workspace, RESULT_FILES
 from pointcloud_workbench.viewer import render_viewer
+from pointcloud_workbench.alignment import render_body_view
 from pointcloud_workbench.core import np, read_json
 
 APP_DIR = Path(__file__).resolve().parent
@@ -53,10 +54,10 @@ def make_handler(workspace, token):
                     return
                 url = urlparse(self.path)
                 q = parse_qs(url.query)
-                if url.path == '/':
-                    page = (APP_DIR/'index.html').read_text(encoding='utf-8').replace('__TOKEN__', token)
+                if url.path in {'/', '/alignment'}:
+                    page = (APP_DIR/('alignment.html' if url.path == '/alignment' else 'index.html')).read_text(encoding='utf-8').replace('__TOKEN__', token)
                     self.send(page.encode('utf-8'), 'text/html; charset=utf-8')
-                elif url.path in {'/workbench.js', '/workbench.css'}:
+                elif url.path in {'/workbench.js', '/workbench.css', '/alignment.js', '/alignment.css'}:
                     mime = 'text/javascript; charset=utf-8' if url.path.endswith('.js') else 'text/css; charset=utf-8'
                     self.send((APP_DIR/url.path[1:]).read_bytes(), mime)
                 elif url.path == '/api/session':
@@ -67,6 +68,9 @@ def make_handler(workspace, token):
                 elif url.path == '/api/state': self.send(workspace.state())
                 elif url.path == '/api/job':
                     with workspace.lock: self.send({'job': workspace.job})
+                elif url.path == '/api/alignment/preview':
+                    payload = {key: values[0] for key, values in q.items()}
+                    self.send(workspace.alignment.preview(payload).encode('utf-8'), 'text/html; charset=utf-8')
                 elif url.path == '/api/validation':
                     with workspace.lock:
                         if q.get('dataset_id', [''])[0] != workspace.dataset_id:
@@ -77,14 +81,18 @@ def make_handler(workspace, token):
                         if q.get('dataset_id', [''])[0] != workspace.dataset_id:
                             raise ValueError('目录已切换，请重新选择采集')
                         p = workspace.media(q['id'][0], q['file'][0])
-                        if p.suffix == '.html':
+                        if p.name in {'preview.html', 'body_preview.html'}:
                             # Render old and new exports through the current viewer without changing saved files.
-                            arrays = workspace.media(q['id'][0], 'points.npz')
-                            report = read_json(workspace.media(q['id'][0], 'pointcloud.json'))
+                            body = p.name == 'body_preview.html'
+                            arrays = workspace.media(q['id'][0], 'body_points.npz' if body else 'points.npz')
+                            report = read_json(workspace.media(q['id'][0], 'alignment.json' if body else 'pointcloud.json'))
                         else: data = p.read_bytes()
                     if p.suffix == '.html':
-                        with np.load(arrays, allow_pickle=False) as saved:
-                            page = render_viewer(saved, report, embedded=True)
+                        if p.name in {'preview.html', 'body_preview.html'}:
+                            with np.load(arrays, allow_pickle=False) as saved:
+                                page = render_body_view(saved, report) if body else render_viewer(saved, report, embedded=True)
+                        else:
+                            page = data.decode('utf-8')
                         # Rewrite HTML attributes only. The script may contain selectors or
                         # recorded strings with the same text, which must remain untouched.
                         markup, separator, script = page.partition('<script>')
@@ -122,6 +130,10 @@ def make_handler(workspace, token):
                 elif self.path == '/api/load': self.send(workspace.load(payload))
                 elif self.path == '/api/open_results': self.send(workspace.open_results(payload.get('path')))
                 elif self.path == '/api/mark_skipped': self.send(workspace.mark_skipped(payload))
+                elif self.path == '/api/review_cloud': self.send(workspace.review_cloud(payload))
+                elif self.path in {'/api/alignment/context', '/api/alignment/fit', '/api/alignment/save', '/api/alignment/confirm'}:
+                    method = self.path.rsplit('/', 1)[1]
+                    self.send(getattr(workspace.alignment, method)(payload))
                 elif self.path == '/api/generate': self.send(workspace.start(payload, 'generate'))
                 elif self.path == '/api/export': self.send(workspace.start(payload, 'export'))
                 elif self.path == '/api/stop': self.send(workspace.stop())
