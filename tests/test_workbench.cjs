@@ -20,7 +20,7 @@ async function setup(initial = dataset) {
     return {value:'', checked:false, disabled:false, hidden:false, textContent:'', children:[],
       classList:{toggle() {}, add() {}}, parentElement:{}, listeners:{},
       append(...items) { this.children.push(...items); }, replaceChildren() { this.children=[]; },
-      setAttribute() {}, removeAttribute() {}, scrollIntoView() {}, focus() {},
+      contentWindow:{}, setAttribute(name, value) {this[name]=value;}, removeAttribute(name) {delete this[name];}, scrollIntoView() {}, focus() {},
       addEventListener(name, fn) { this.listeners[name] = fn; },
       showModal() { this.open=true; }, close() { this.open=false; this.listeners.close?.(); }};
   }
@@ -28,9 +28,11 @@ async function setup(initial = dataset) {
     elements.set(match[1], element());
   }
   elements.get('filter').value='all';
+  for (const id of ['exportKeep','exportPending','exportReject']) elements.get(id).checked=true;
   const requests=[];
-  const sandbox = {APP_TOKEN:'test', URLSearchParams, Set, requestAnimationFrame:fn=>fn(),
-    setTimeout:()=>1, clearTimeout() {}, window:{addEventListener() {}},
+  const listeners = {};
+  const sandbox = {APP_TOKEN:'test', URLSearchParams, Set, requestAnimationFrame:fn=>fn(), location:{origin:'http://localhost'},
+    setTimeout:()=>1, clearTimeout() {}, window:{addEventListener(name, fn) {listeners[name]=fn;}},
     document:{getElementById:id=>elements.get(id), createElement:element,
       querySelectorAll:()=>[], querySelector:selector=>selector.includes('scope') ? {value:'selected'} : null},
     fetch: async (url, options) => {
@@ -42,7 +44,9 @@ async function setup(initial = dataset) {
   const context=vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(app,'workbench.js'),'utf8'),context);
   await settle();
-  return {elements, requests, sandbox, run:code=>vm.runInContext(code,context)};
+  const notify = data => listeners.message({origin:'http://localhost',source:elements.get('alignmentEditor').contentWindow,
+    data:{type:'pointcloud-alignment',dataset_id:'one',id:'1',...data}});
+  return {elements, requests, sandbox, listeners, notify, run:code=>vm.runInContext(code,context)};
 }
 
 test('reload with no selection offers reviewed captures and never includes drafts by default', async () => {
@@ -137,58 +141,313 @@ test('opening results selects a generated capture when current input has no clou
   assert.equal(ui.elements.get('viewer').hidden,false);
 });
 
+test('aligned exports open in the body frame and can switch back to the camera frame', async () => {
+  const ui=await setup({...dataset,clouds:1,results:'/aligned',frames:[frame('1',{
+    has_cloud:true,has_alignment:true,points:100,cloud_input_mode:'infrared'})]});
+  assert.equal(ui.elements.get('coordinateFrame').value,'body');
+  assert.match(ui.elements.get('viewer').src,/body_preview.html/);
+  ui.elements.get('coordinateFrame').value='camera';ui.elements.get('coordinateFrame').onchange();
+  assert.match(ui.elements.get('viewer').src,/file=preview.html/);
+  ui.run("state.frames[0].has_alignment=false; renderViewer();");
+  assert.equal(ui.elements.get('bodyCoordinate').disabled,true);
+  assert.equal(ui.elements.get('coordinateFrame').value,'camera');
+});
+
+test('coordinate alignment stays in the workbench and switching views keeps the editor', async () => {
+  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100})]});
+  ui.sandbox.window.open=()=>assert.fail('must not open a new tab');
+  ui.elements.get('alignCurrent').onclick();
+  const url=ui.elements.get('alignmentEditor').src;
+  assert.match(url,/^\/alignment\?/);assert.match(url,/dataset_id=one/);assert.match(url,/id=1/);
+  assert.match(url,/embedded=1/);
+  assert.equal(ui.elements.get('alignmentEditor').hidden,false);
+  assert.equal(ui.elements.get('viewer').hidden,true);
+  await ui.notify({action:'busy',busy:false});
+  ui.elements.get('viewCloud').onclick();
+  assert.equal(ui.elements.get('viewer').hidden,false);
+  assert.equal(ui.elements.get('alignmentEditor').src,url);
+  ui.elements.get('alignCurrent').onclick();
+  assert.equal(ui.elements.get('alignmentEditor').src,url);
+});
+
+test('saving an inline alignment refreshes body viewing without replacing the capture list', async () => {
+  const initial={...dataset,clouds:2,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})]};
+  const ui=await setup(initial);ui.elements.get('alignCurrent').onclick();
+  await ui.notify({action:'busy',busy:false});
+  const url=ui.elements.get('alignmentEditor').src;
+  ui.sandbox.reply=async()=>({...initial,frames:[{...initial.frames[0],has_alignment:true,alignment_revision:'new'},initial.frames[1]]});
+  await ui.notify({action:'saved',output:'/aligned'});
+  assert.equal(ui.run('state.frames.length'),2);
+  assert.equal(ui.run('state.results'),'/clouds');
+  assert.equal(ui.elements.get('coordinateFrame').value,'body');
+  assert.equal(ui.elements.get('alignmentEditor').src,url);
+  assert.match(ui.elements.get('viewer').src,/body_preview.html.*alignment=new/);
+  assert.equal(ui.elements.has('nextAlignment'),false);
+  ui.run("selectCapture('2')");
+  assert.equal(ui.run('current'),'2');
+  assert.match(ui.elements.get('alignmentEditor').src,/id=2/);
+});
+
+test('an editor load failure releases action locks and allows retry', async () => {
+  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100})]});
+  ui.elements.get('alignCurrent').onclick();
+  assert.equal(ui.run('alignmentBusy'),true);
+  ui.elements.get('alignmentEditor').onerror();
+  assert.equal(ui.run('alignmentBusy'),false);
+  assert.equal(ui.elements.get('generate').disabled,false);
+  assert.equal(ui.elements.get('viewer').hidden,false);
+  ui.elements.get('alignCurrent').onclick();
+  assert.equal(ui.elements.get('alignmentEditor').hidden,false);
+});
+
+test('only the current inline editor may refresh or unlock the workbench', async () => {
+  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100})]});
+  ui.elements.get('alignCurrent').onclick();
+  await ui.notify({action:'busy',busy:false,id:'old'});
+  assert.equal(ui.run('alignmentBusy'),true);
+  await ui.listeners.message({origin:'https://other.test',source:ui.elements.get('alignmentEditor').contentWindow,
+    data:{type:'pointcloud-alignment',action:'busy',busy:false,id:'1',dataset_id:'one'}});
+  assert.equal(ui.run('alignmentBusy'),true);
+  await ui.notify({action:'busy',busy:false});
+  assert.equal(ui.run('alignmentBusy'),false);
+});
+
 test('results from another segmentation can be viewed but require reloading inputs before generation', async () => {
   const ui=await setup({...dataset,results_match_inputs:false});
   assert.equal(ui.elements.get('generate').disabled,true);
   assert.match(ui.elements.get('generationHint').textContent,/不是同一批输入/);
 });
 
-test('finished jobs use a collapsed summary and keep failure records accessible', async () => {
-  const job={id:'done',mode:'generate',status:'completed_with_errors',done:2,total:2,success:1,
-    output:'/clouds',current:'已保存',skipped:[],errors:[{relative_dir:'pig_2/capture',error:'深度缺失'}]};
-  const ui=await setup({...dataset,job});
-  assert.equal(ui.elements.get('jobBody').hidden,true);
-  assert.equal(ui.elements.get('jobToggle').hidden,false);
-  assert.match(ui.elements.get('jobCounts').textContent,/失败 1/);
-  ui.elements.get('jobToggle').onclick();
-  assert.equal(ui.elements.get('jobBody').hidden,false);
-  assert.match(ui.elements.get('jobCurrent').textContent,/\/clouds/);
-  assert.match(ui.elements.get('jobErrors').children[0].textContent,/深度缺失/);
-  ui.elements.get('jobToggle').onclick();
-  assert.equal(ui.elements.get('jobBody').hidden,true);
+test('failed and manually skipped captures stay visible and never enter automatic generation', async () => {
+  const frames=[frame('1'),frame('2',{reviewed:true,status:'reviewed',
+    validation_errors:['分割清单与逐帧输入模式不一致']}),frame('3',{excluded:true})];
+  const ui=await setup({...dataset,frames,pigs:3});
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['1']);
+  assert.match(ui.elements.get('generationHint').textContent,/核对失败 1 次.*手动标记 1 次/);
+  assert.match(ui.elements.get('showValidation').textContent,/核对失败 1/);
+  ui.elements.get('filter').value='failed';
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['2']);
+  ui.elements.get('filter').value='excluded';
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['3']);
+  ui.run("selected = new Set(['1','2','3']); controls();");
+  assert.equal(ui.elements.get('generate').disabled,false);
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['1','2','3']);
 });
 
-test('running progress stays visible and collapses when the job finishes', async () => {
-  const job={id:'running',mode:'generate',status:'running',done:1,total:2,success:1,
-    current:'pig_2/capture',skipped:[],errors:[]};
-  const ui=await setup({...dataset,job});
-  assert.equal(ui.elements.get('jobBody').hidden,false);
-  assert.equal(ui.elements.get('jobToggle').hidden,true);
-  assert.equal(ui.elements.get('generationHint').hidden,true);
-  ui.run("state.job.status='completed'; renderJob();");
-  assert.equal(ui.elements.get('jobBody').hidden,true);
-  assert.equal(ui.elements.get('jobToggle').hidden,false);
+test('marking current capture updates workspace through authenticated API without changing segmentation', async () => {
+  const ui=await setup();
+  ui.sandbox.reply=async(url,payload)=>{
+    assert.equal(url,'/api/mark_skipped');
+    assert.equal(payload.excluded,true);
+    return clone({...dataset,frames:[frame('1',{excluded:true}),dataset.frames[1]]});
+  };
+  await ui.elements.get('toggleExcluded').onclick();
+  const request=ui.requests.find(r=>r.url==='/api/mark_skipped');
+  assert.deepEqual(request.payload,{dataset_id:'one',ids:['1'],excluded:true});
+  assert.equal(ui.elements.get('toggleExcluded').textContent,'取消跳过标记');
+  assert.equal(ui.elements.get('generate').disabled,true);
+  assert.match(ui.elements.get('message').textContent,/标记 1 次采集为跳过/);
 });
 
-test('viewing clouds hides generation instructions until input directories change', async () => {
-  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100})]});
-  assert.equal(ui.elements.get('generationHint').hidden,true);
-  ui.elements.get('source').value='/different-input';
-  ui.elements.get('source').listeners.input();
-  assert.equal(ui.elements.get('generationHint').hidden,false);
-  assert.match(ui.elements.get('generationHint').textContent,/输入目录已更改/);
+test('camera and segmentation filters are independent and use recorded camera metadata', async () => {
+  const rows=[frame('itof-rgb',{camera:{type:'itof'},input_mode:'rgb'}),
+    frame('itof-ir',{camera:{type:'itof'},input_mode:'infrared'}),
+    frame('stereo-rgb',{camera:{type:'stereo'},input_mode:'rgb',relative_dir:'itof_misleading/capture'}),
+    frame('unknown',{input_mode:'rgb'})];
+  const ui=await setup({...dataset,frames:rows});
+  assert.match(ui.elements.get('cameraFilter').children.find(c=>c.value==='itof').textContent,/2/);
+  ui.elements.get('cameraFilter').value='itof';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['itof-rgb','itof-ir']);
+  ui.elements.get('modeFilter').value='infrared';ui.elements.get('modeFilter').onchange();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['itof-ir']);
+  assert.equal(ui.run('current'),'itof-ir');
+  ui.elements.get('cameraFilter').value='stereo';ui.elements.get('modeFilter').value='rgb';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['stereo-rgb']);
 });
 
-test('successful polling leaves one job summary while failures and warnings remain visible', async () => {
-  for (const warning of ['', '有采集需要复核']) {
-    const active={id:'poll',mode:'generate',status:'running',done:0,total:1,success:0,errors:[],skipped:[]};
-    const job={...active,status:'completed',done:1,success:1,output:'/clouds',warning};
-    const ui=await setup({...dataset,job:active});
-    ui.sandbox.reply=async url=>url==='/api/job' ? {job} : {...dataset,job,clouds:1,results:'/clouds',
-      frames:[frame('1',{has_cloud:true,points:100})]};
-    await ui.run('poll()');
-    assert.equal(ui.elements.get('message').textContent,warning);
-    assert.equal(ui.elements.get('jobBody').hidden,true);
-    assert.equal(ui.elements.get('generationHint').hidden,true);
+test('without explicit selection generation follows the visible camera and segmentation scope', async () => {
+  const ui=await setup({...dataset,frames:[frame('one',{camera:{type:'itof'},input_mode:'rgb'}),
+    frame('two',{camera:{type:'stereo'},input_mode:'rgb'}),frame('three',{camera:{type:'itof'},input_mode:'infrared'})]});
+  ui.elements.get('cameraFilter').value='itof';ui.elements.get('modeFilter').value='rgb';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['one']);
+  await ui.elements.get('generate').onclick();
+  assert.deepEqual(ui.requests.find(r=>r.url==='/api/generate').payload.ids,['one']);
+});
+
+test('empty filtered lists clear the viewer and refresh generation availability', async () => {
+  const ui=await setup({...dataset,frames:[frame('one',{camera:{type:'itof'},input_mode:'rgb'})]});
+  ui.elements.get('cameraFilter').value='stereo';ui.elements.get('cameraFilter').onchange();
+  assert.equal(ui.run('current'),null);
+  assert.equal(ui.elements.get('viewer').hidden,true);
+  assert.equal(ui.elements.get('generate').disabled,true);
+});
+
+test('finished task details remain available from the compact footer', async () => {
+  const ui=await setup({...dataset,job:{id:'done',mode:'generate',status:'completed_with_errors',
+    total:2,done:2,success:1,current:'已保存',output:'/out/result',skipped:[],errors:[{relative_dir:'pig_2/capture',error:'配准失败'}]}});
+  assert.equal(ui.elements.get('showJob').hidden,false);
+  assert.match(ui.elements.get('showJob').textContent,/部分完成 2\/2.*1 项/);
+  ui.elements.get('showJob').onclick();assert.equal(ui.elements.get('jobDialog').open,true);
+  assert.match(ui.elements.get('jobErrors').children[0].textContent,/pig_2\/capture.*配准失败/);
+  ui.elements.get('closeJob').onclick();assert.equal(ui.elements.get('jobDialog').open,false);
+});
+
+test('cloud quality selection is authenticated and separate from segmentation review', async () => {
+  const row=frame('1',{has_cloud:true,points:100,cloud_decision:'pending',reviewed:false,status:'draft'});
+  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[row]});
+  ui.sandbox.reply=async(url,payload)=>({...dataset,clouds:1,results:'/clouds',frames:[{...row,cloud_decision:payload.decision}]});
+  await ui.elements.get('cloudReject').onclick();
+  assert.equal(ui.elements.get('cloudReject')['aria-pressed'],'true');
+  assert.equal(ui.elements.get('cloudPending')['aria-pressed'],'false');
+  assert.deepEqual(ui.requests.find(r=>r.url==='/api/review_cloud').payload,{dataset_id:'one',id:'1',decision:'reject'});
+  assert.equal(ui.run('state.frames[0].reviewed'),false);
+  assert.equal(ui.run('state.frames[0].cloud_decision'),'reject');
+  ui.elements.get('filter').value='reject';ui.elements.get('filter').listeners.input();
+  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['1']);
+});
+
+test('aligned export includes all three selected review states in separate folders', async () => {
+  const frames=[frame('1',{has_cloud:true,points:100,has_alignment:true,cloud_decision:'keep'}),
+    frame('2',{has_cloud:true,points:100,has_alignment:true,cloud_decision:'pending'}),
+    frame('3',{has_cloud:true,points:100,has_alignment:true,cloud_decision:'reject'}),
+    frame('4',{has_cloud:true,points:100,has_alignment:false,cloud_decision:'keep'})];
+  const ui=await setup({...dataset,frames,clouds:4,results:'/clouds'});
+  ui.elements.get('export').onclick();
+  assert.equal(ui.elements.has('exportAligned'),false);
+  assert.equal(ui.elements.get('exportContent').value,'aligned');
+  assert.equal(ui.elements.get('exportDialog').open,true);
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','2','3']);
+  for (const label of ['保留/','待定/','淘汰/']) assert.ok(ui.elements.get('exportTree').textContent.includes(label));
+  ui.elements.get('exportPending').checked=false;ui.elements.get('exportPending').onchange();
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','3']);
+  ui.elements.get('exportParent').value='/chosen';ui.elements.get('exportName').value='aligned-output';
+  await ui.elements.get('confirmExport').onclick();
+  assert.deepEqual(ui.requests.find(r=>r.url==='/api/export').payload,
+    {dataset_id:'one',ids:['1','3'],scope_ids:['1','2','3','4'],parent:'/chosen',name:'aligned-output',aligned_only:true,decisions:['keep','reject'],group_by_decision:true});
+});
+
+test('full export also groups pending and rejected clouds and enforces review checkboxes', async () => {
+  const frames=[frame('1',{has_cloud:true,has_alignment:true,cloud_decision:'keep'}),
+    frame('2',{has_cloud:true,has_alignment:true,cloud_decision:'pending'}),
+    frame('3',{has_cloud:true,cloud_decision:'reject'}),frame('4',{has_cloud:true,cloud_decision:'pending'})];
+  const ui=await setup({...dataset,frames,clouds:4,results:'/clouds'});
+  ui.elements.get('export').onclick();
+  ui.elements.get('exportContent').value='all';ui.elements.get('exportContent').onchange();
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','2','3','4']);
+  await ui.elements.get('confirmExport').onclick();
+  const payload=ui.requests.find(r=>r.url==='/api/export').payload;
+  assert.equal(payload.aligned_only,false);assert.equal(payload.group_by_decision,true);
+  assert.deepEqual(payload.decisions,['keep','pending','reject']);
+  ui.elements.get('exportContent').value='aligned';ui.elements.get('exportPending').checked=false;
+  ui.elements.get('exportContent').onchange();
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1']);
+  for (const id of ['exportKeep','exportPending','exportReject']) ui.elements.get(id).checked=false;
+  ui.elements.get('exportKeep').onchange();
+  assert.equal(ui.elements.get('confirmExport').disabled,true);
+  assert.match(ui.elements.get('exportEligibility').textContent,/至少勾选/);
+});
+
+test('alignment hides input skip action while pending and reject remain directly editable', async () => {
+  const row=frame('1',{has_cloud:true,points:100});
+  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[row]});
+  assert.equal(ui.elements.get('toggleExcluded').hidden,false);
+  ui.elements.get('alignCurrent').onclick();await ui.notify({action:'busy',busy:false});
+  assert.equal(ui.elements.get('toggleExcluded').hidden,true);
+  ui.sandbox.reply=async(url,payload)=>({...dataset,clouds:1,results:'/clouds',frames:[{...row,cloud_decision:payload.decision}]});
+  for (const decision of ['reject','pending']) {
+    await ui.elements.get({reject:'cloudReject',pending:'cloudPending'}[decision]).onclick();
+    assert.equal(ui.run('state.frames[0].cloud_decision'),decision);
+    assert.equal(ui.run('state.frames[0].has_alignment'),undefined);
   }
+  ui.elements.get('viewCloud').onclick();
+  assert.equal(ui.elements.get('toggleExcluded').hidden,false);
+});
+
+test('a failed export keeps its destination and error visible in the export dialog', async () => {
+  const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100})]});
+  ui.elements.get('export').onclick();ui.elements.get('exportName').value='existing';
+  ui.sandbox.reply=async()=>{throw new Error('成果文件夹已存在')};
+  await ui.elements.get('confirmExport').onclick();
+  assert.equal(ui.elements.get('exportDialog').open,true);
+  assert.equal(ui.elements.get('exportName').value,'existing');
+  assert.match(ui.elements.get('exportMessage').textContent,/已存在/);
+  assert.equal(ui.elements.get('confirmExport').disabled,false);
+});
+
+test('quality buttons auto advance only after a successful save, skipping aligned and rejected captures', async () => {
+  const frames=[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100,has_alignment:true}),
+    frame('3',{has_cloud:true,points:100,cloud_decision:'reject'}),frame('4',{has_cloud:true,points:100})];
+  const ui=await setup({...dataset,frames,clouds:4,results:'/clouds'});
+  ui.elements.get('alignCurrent').onclick();await ui.notify({action:'busy',busy:false});
+  ui.elements.get('autoNextAlignment').checked=true;
+  let finish;
+  ui.sandbox.reply=()=>new Promise(resolve=>{finish=resolve;});
+  const save=ui.elements.get('cloudPending').onclick();
+  assert.equal(ui.run('current'),'1');
+  finish({...dataset,frames,clouds:4,results:'/clouds'});await save;
+  assert.equal(ui.run('current'),'4');
+  assert.match(ui.elements.get('alignmentEditor').src,/id=4/);
+  await ui.notify({action:'busy',busy:false,id:'4'});
+  ui.sandbox.reply=async()=>({...dataset,frames,clouds:4,results:'/clouds'});
+  await ui.elements.get('cloudPending').onclick();
+  assert.equal(ui.run('current'),'4');
+  assert.match(ui.elements.get('message').textContent,/后面已没有/);
+});
+
+test('quality save failure never advances or changes the highlighted decision', async () => {
+  const frames=[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})];
+  const ui=await setup({...dataset,frames,clouds:2,results:'/clouds'});
+  ui.elements.get('alignCurrent').onclick();await ui.notify({action:'busy',busy:false});
+  ui.elements.get('autoNextAlignment').checked=true;
+  ui.sandbox.reply=async()=>{throw new Error('写入失败')};
+  await ui.elements.get('cloudReject').onclick();
+  assert.equal(ui.run('current'),'1');
+  assert.equal(ui.elements.get('cloudPending')['aria-pressed'],'true');
+  assert.match(ui.elements.get('message').textContent,/写入失败/);
+});
+
+test('alignment confirmation auto advances after the editor unlocks in either message order', async () => {
+  for (const unlockFirst of [false,true]) {
+    const frames=[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})];
+    const ui=await setup({...dataset,frames,clouds:2,results:'/clouds'});
+    ui.elements.get('alignCurrent').onclick();
+    ui.elements.get('autoNextAlignment').checked=true;
+    let finish;
+    ui.sandbox.reply=()=>new Promise(resolve=>{finish=resolve;});
+    const save=ui.notify({action:'saved',output:'/aligned'});
+    if (unlockFirst) await ui.notify({action:'busy',busy:false});
+    finish({...dataset,frames:[{...frames[0],has_alignment:true,cloud_decision:'keep'},frames[1]],clouds:2,results:'/clouds'});
+    await save;
+    if (!unlockFirst) {
+      assert.equal(ui.run('current'),'1');
+      await ui.notify({action:'busy',busy:false});
+    }
+    assert.equal(ui.run('current'),'2');
+    assert.equal(ui.run('state.frames[0].cloud_decision'),'keep');
+  }
+});
+
+test('without auto advance the saved capture stays visible even when its filter no longer matches', async () => {
+  const frames=[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})];
+  const ui=await setup({...dataset,frames,clouds:2,results:'/clouds'});
+  ui.elements.get('filter').value='pending';ui.elements.get('filter').listeners.input();
+  ui.elements.get('alignCurrent').onclick();await ui.notify({action:'busy',busy:false});
+  ui.sandbox.reply=async()=>({...dataset,frames:[{...frames[0],cloud_decision:'reject'},frames[1]],clouds:2,results:'/clouds'});
+  await ui.elements.get('cloudReject').onclick();
+  assert.equal(ui.run('current'),'1');
+  assert.equal(ui.elements.get('cloudReject')['aria-pressed'],'true');
+  assert.equal(ui.elements.get('alignmentEditor').hidden,false);
+});
+
+test('late confirmation response cannot move a capture the user has since selected', async () => {
+  const frames=[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})];
+  const ui=await setup({...dataset,frames,clouds:2,results:'/clouds'});
+  ui.elements.get('alignCurrent').onclick();await ui.notify({action:'busy',busy:false});
+  ui.elements.get('autoNextAlignment').checked=true;
+  let finish;ui.sandbox.reply=()=>new Promise(resolve=>{finish=resolve;});
+  const save=ui.notify({action:'saved',output:'/aligned'});
+  ui.run("selectCapture('2')");
+  finish({...dataset,frames:[{...frames[0],has_alignment:true},frames[1]],clouds:2,results:'/clouds'});await save;
+  assert.equal(ui.run('current'),'2');
+  assert.equal(ui.run('pendingAdvance'),null);
 });

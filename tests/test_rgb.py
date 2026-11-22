@@ -94,6 +94,39 @@ class RGBCloudTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'来源已变化'):
             reconstruct(self.source,self.seg,True)
 
+    def test_unsynchronized_rgb_mask_is_rejected_instead_of_only_disabling_colors(self):
+        for delta in ('25000', '-25000'):
+            self.record['selected_capture']['timestamp_deltas']['color_minus_depth_device_us'] = delta
+            write_json(self.source/'reconstruction.json', self.record)
+            self.refresh_metadata()
+            with self.assertRaisesRegex(ValueError, 'RGB 掩码不能用于该深度帧'):
+                reconstruct(self.source, self.seg, True)
+
+    def test_timestamps_must_agree_with_delta_before_using_rgb_mask(self):
+        streams = self.record['selected_capture']['streams']
+        streams['color']['identity']['device_timestamp_us'] = '30000'
+        streams['depth']['identity']['device_timestamp_us'] = '1000'
+        self.record['alignment']['target_color_identity'] = dict(streams['color']['identity'])
+        self.record['alignment']['source_depth_identity'] = dict(streams['depth']['identity'])
+        write_json(self.source/'reconstruction.json', self.record)
+        # Keep align provenance identities consistent so this tests the timing gate.
+        self.refresh_metadata()
+        with self.assertRaisesRegex(ValueError, '时间戳与记录的时间差不一致'):
+            reconstruct(self.source, self.seg, True)
+
+    def test_native_crosscheck_is_hashed_exported_and_linked_without_changing_xyz(self):
+        before, _, _ = reconstruct(self.source, self.seg, True)
+        np.save(self.source/'depth_sensor_code_u16.npy', np.full((2, 3), 3881, np.uint16))
+        payload, report, mask = reconstruct(self.source, self.seg, True)
+        np.testing.assert_array_equal(payload['xyz_mm'], before['xyz_mm'])
+        self.assertIn('depth_sensor_code_u16.npy', report['source_sha256'])
+        self.assertEqual(report['rgb_registration']['check_image'], 'rgb_registration_check.png')
+        dest = export_frame(self.root/'checked', payload, report, mask)
+        write_viewer(dest/'preview.html', payload, report)
+        self.assertIn('rgb_registration_check.png', (dest/'preview.html').read_text())
+        with Image.open(dest/'rgb_registration_check.png') as check:
+            self.assertEqual(check.size, (9, 7))
+
     def test_export_preserves_sources_correct_check_image_grid_and_missing_ir(self):
         before={p.name:sha256(p) for p in self.source.iterdir()}
         payload,report,mask=reconstruct(self.source,self.seg,True)
@@ -137,6 +170,36 @@ class RGBCloudTest(unittest.TestCase):
         self.assertEqual(state['clouds'],1)
         self.assertTrue(state['frames'][0]['has_ir_file'])
         self.assertFalse(state['frames'][0]['infrared_available'])
+
+    def test_unsynchronized_rgb_capture_does_not_block_other_captures(self):
+        source, seg = self.root/'raw-batch', self.root/'mask-batch'
+        source.mkdir(); seg.mkdir()
+        rows = []
+        for name in ('bad', 'good'):
+            shutil.copytree(self.source, source/name)
+            shutil.copytree(self.seg, seg/name)
+            if name == 'bad':
+                record = read_json(source/name/'reconstruction.json')
+                record['selected_capture']['timestamp_deltas']['color_minus_depth_device_us'] = '25000'
+                write_json(source/name/'reconstruction.json', record)
+                _, _, geometry, _ = prepare_frame(source/name, 'rgb')
+                meta = read_json(seg/name/'segmentation.json')
+                meta.update(geometry=geometry, source_sha256=geometry['source_sha256'])
+                write_json(seg/name/'segmentation.json', meta)
+            rows.append({'relative_dir':name, 'pig_id':'test', 'capture_id':name})
+        write_json(seg/'dataset.json', {'input_mode':'rgb', 'frames':rows})
+        ws = Workspace(self.root/'batch-settings')
+        state = ws.load({'source':str(source), 'segmentation':str(seg)})
+        ws.start({'dataset_id':state['dataset_id'], 'ids':[r['id'] for r in state['frames']],
+                  'parent':str(self.root), 'name':'timing-result', 'allow_draft':True}, 'generate')
+        ws.worker.join(10)
+        self.assertFalse(ws.worker.is_alive())
+        self.assertEqual(ws.job['status'], 'completed_with_errors', ws.job)
+        self.assertEqual(ws.job['success'], 1)
+        self.assertEqual(len(ws.job['errors']), 1)
+        self.assertIn('RGB 掩码不能用于该深度帧', ws.job['errors'][0]['error'])
+        self.assertTrue((self.root/'timing-result/good/cloud_rgb_mm.ply').is_file())
+        self.assertFalse((self.root/'timing-result/bad').exists())
 
     def test_http_rgb_preview_executes_and_rewrites_only_markup(self):
         import json

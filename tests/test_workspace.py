@@ -38,6 +38,14 @@ class WorkspaceTest(unittest.TestCase):
         if self.ws.worker: self.ws.worker.join(10)
         self.fixture.tearDown()
 
+    def directory_symlink(self, link, target):
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            if getattr(exc, 'winerror', None) == 1314:
+                self.skipTest('Windows 当前用户没有创建符号链接的权限')
+            raise
+
     def payload(self, name='generated', **extra):
         return {'dataset_id':self.ws.dataset_id, 'ids':[self.ws.state()['frames'][0]['id']],
                 'parent':str(self.root), 'name':name, **extra}
@@ -101,6 +109,88 @@ class WorkspaceTest(unittest.TestCase):
         self.assertNotEqual(state['export_parent'], foreign)
         self.assertEqual(read_json(state_dir/'settings.json'), settings)
 
+    def test_cloud_quality_review_is_reversible_persistent_and_portable(self):
+        generated=self.generate()
+        frame=self.ws.state()['frames'][0]
+        before={str(p):sha256(p) for root in [self.source,self.seg,generated] for p in root.rglob('*') if p.is_file()}
+        for decision in ['reject','pending','keep']:
+            state=self.ws.review_cloud({'dataset_id':self.ws.dataset_id,'id':frame['id'],'decision':decision})
+            self.assertEqual(state['frames'][0]['cloud_decision'],decision)
+        self.assertEqual(before,{str(p):sha256(p) for root in [self.source,self.seg,generated] for p in root.rglob('*') if p.is_file()})
+        restored=Workspace(self.root/'settings')
+        self.assertEqual(restored.state()['frames'][0]['cloud_decision'],'keep')
+        self.ws.start(self.payload('reviewed-export'),'export');self.ws.worker.join(10)
+        self.assertEqual(self.ws.job['status'],'completed',self.ws.job)
+        exported=self.root/'reviewed-export'
+        self.assertEqual(read_json(exported/self.rel/'cloud_review.json')['decision'],'keep')
+        portable=Workspace(self.root/'new-state',initial_results=exported)
+        self.assertEqual(portable.state()['frames'][0]['cloud_decision'],'keep')
+        record=read_json(exported/self.rel/'cloud_review.json');record['input_mode']='rgb'
+        write_json(exported/self.rel/'cloud_review.json',record)
+        portable=Workspace(self.root/'third-state',initial_results=exported)
+        self.assertEqual(portable.state()['frames'][0]['cloud_decision'],'pending')
+        self.assertIn('恢复为待定',portable.state()['warning'])
+        with self.assertRaisesRegex(ValueError,'目录已切换'):
+            self.ws.review_cloud({'dataset_id':'stale','id':frame['id'],'decision':'reject'})
+        with self.assertRaisesRegex(ValueError,'只能是'):
+            self.ws.review_cloud({'dataset_id':self.ws.dataset_id,'id':frame['id'],'decision':'other'})
+
+    def test_camera_classification_uses_capture_record_before_generation(self):
+        path = self.source/self.rel/'reconstruction.json'
+        record = read_json(path)
+        for model, kind in [('Orbbec Femto Bolt', 'itof'), ('Orbbec Gemini 336L', 'stereo')]:
+            record['runtime']['device'] = {'name': model}
+            write_json(path, record)
+            state = self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
+            self.assertEqual(state['frames'][0]['camera']['type'], kind)
+
+    def test_grouped_full_export_copies_rejected_cloud_and_validates_manifest_paths(self):
+        generated=self.generate();frame=self.ws.state()['frames'][0]
+        self.ws.review_cloud({'dataset_id':self.ws.dataset_id,'id':frame['id'],'decision':'reject'})
+        self.ws.start(self.payload('grouped-reject',decisions=['reject','pending'],group_by_decision=True),'export')
+        self.ws.worker.join(10)
+        self.assertEqual(self.ws.job['status'],'completed',self.ws.job)
+        output=self.root/'grouped-reject';dest=output/'淘汰'/self.rel
+        self.assertEqual(sha256(dest/'points.npz'),sha256(generated/self.rel/'points.npz'))
+        self.assertTrue((output/'待定').is_dir())
+        portable=Workspace(self.root/'new-grouped-state',initial_results=output)
+        self.assertEqual(portable.state()['frames'][0]['relative_dir'],self.rel)
+        self.assertEqual(portable.state()['frames'][0]['cloud_decision'],'reject')
+        manifest=read_json(output/'pointcloud_dataset.json')
+        manifest['frames'][0]['storage_relative_dir']='../escape'
+        write_json(output/'pointcloud_dataset.json',manifest)
+        with self.assertRaisesRegex(ValueError,'非法'):
+            self.ws.open_results(str(output))
+        for decisions in ([],['unknown'],['reject','reject'],'reject'):
+            with self.assertRaisesRegex(ValueError,'导出状态'):
+                self.ws.start(self.payload('invalid-groups',decisions=decisions,group_by_decision=True),'export')
+        with self.assertRaisesRegex(ValueError,'未勾选'):
+            self.ws.start(self.payload('unselected',decisions=['keep'],group_by_decision=True),'export')
+
+    def test_export_updates_legacy_preview_without_changing_measured_files(self):
+        generated = self.generate()
+        original = generated/self.rel/'preview.html'
+        original.write_text('<html>legacy dark preview</html>')
+        self.ws.start(self.payload('updated-preview'), 'export'); self.ws.worker.join(10)
+        self.assertEqual(self.ws.job['status'], 'completed', self.ws.job)
+        copied = self.root/'updated-preview'/self.rel
+        self.assertIn('color-scheme:light', (copied/'preview.html').read_text())
+        self.assertIn('legacy dark preview', original.read_text())
+        for name in ['points.npz', 'cloud_ir_mm.ply', 'pointcloud.json']:
+            self.assertEqual(sha256(generated/self.rel/name), sha256(copied/name))
+
+    def test_reopen_restores_terminal_task_details_without_restoring_a_running_job(self):
+        generated = self.generate()
+        restored = Workspace(self.root/'settings')
+        self.assertEqual(restored.state()['job']['status'], 'completed')
+        self.assertEqual(restored.state()['job']['success'], 1)
+        self.assertIsNone(restored.worker)
+        report = read_json(generated/'export.json')
+        for change in [{'status':'running'}, {'status':'stopping'}, {'errors':None}]:
+            write_json(generated/'export.json', {**report, **change})
+            self.assertIsNone(restored.open_results(str(generated))['job'])
+        write_json(generated/'export.json', report)
+
     def test_protect_sources_existing_outputs_and_stale_page(self):
         for parent, name in [(self.source,'output'),(self.seg,'output'),(self.root,'raw')]:
             with self.assertRaises(ValueError): self.ws.start({**self.payload(allow_draft=True),'parent':str(parent),'name':name},'generate')
@@ -111,7 +201,7 @@ class WorkspaceTest(unittest.TestCase):
 
     def test_failed_folder_copy_does_not_publish_partial_capture(self):
         generated = self.generate()
-        (generated/self.rel/'escape').symlink_to(self.source, target_is_directory=True)
+        self.directory_symlink(generated/self.rel/'escape', self.source)
         self.ws.start(self.payload('badcopy'),'export'); self.ws.worker.join(10)
         self.assertEqual(self.ws.job['status'],'failed')
         self.assertIn('符号链接',self.ws.job['errors'][0]['error'])
@@ -182,7 +272,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_open_results_rejects_symlink_ancestor(self):
         generated = self.generate()
         other = self.root/'links'; other.mkdir()
-        (other/'pig_test').symlink_to(generated/'pig_test',target_is_directory=True)
+        self.directory_symlink(other/'pig_test', generated/'pig_test')
         # pathlib does not descend directory symlinks; a root containing only links is not a dataset.
         with self.assertRaises(ValueError): self.ws.open_results(str(other))
 
@@ -190,8 +280,11 @@ class WorkspaceTest(unittest.TestCase):
         dataset=read_json(self.seg/'dataset.json')
         dataset['input_mode']='rgb'
         write_json(self.seg/'dataset.json',dataset)
-        with self.assertRaisesRegex(ValueError,'输入模式不一致'):
-            self.ws.load({'source':str(self.source),'segmentation':str(self.seg)})
+        state = self.ws.load({'source':str(self.source),'segmentation':str(self.seg)})
+        self.assertEqual(state['validation']['failed'], 1)
+        self.assertIn('输入模式不一致', state['frames'][0]['validation_errors'][0])
+        with self.assertRaisesRegex(ValueError, '没有可生成项'):
+            self.ws.start(self.payload(allow_draft=True), 'generate')
 
     def test_open_other_segmentation_results_cannot_generate_from_current_inputs(self):
         generated=self.generate()

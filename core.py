@@ -49,7 +49,10 @@ def primary_ply(report):
 
 
 def required_result_files(report):
-    return COMMON_RESULT_FILES | {primary_ply(report)}
+    files = COMMON_RESULT_FILES | {primary_ply(report)}
+    if report.get('rgb_registration', {}).get('check_image') == 'rgb_registration_check.png':
+        files.add('rgb_registration_check.png')
+    return files
 
 
 def camera_identity(record):
@@ -419,4 +422,14 @@ def export_frame(destination, payload, report, mask):
         u, v = np.rint(uv).astype(int).T
         color_check[v, u] = (color_check[v, u]*.5+np.array([40, 225, 170])*.5).astype(np.uint8)
     Image.fromarray(color_check).save(dest/'rgb_projection_check.png')
+    if report.get('rgb_registration', {}).get('check_image') == 'rgb_registration_check.png':
+        from .registration import registration_image
+        source = Path(report['source_dir'])
+        for name, digest in report['source_sha256'].items():
+            if sha256(source/name) != digest:
+                raise ValueError('导出配准检查图时源数据已变化，请重新生成')
+        check = registration_image(source, read_json(source/'reconstruction.json'), geometry, mask)
+        Image.fromarray(check).save(dest/'rgb_registration_check.png')
+        if any(sha256(source/name) != digest for name, digest in report['source_sha256'].items()):
+            raise ValueError('导出配准检查图期间源数据已变化，请重新生成')
     return dest
