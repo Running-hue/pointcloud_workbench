@@ -124,6 +124,7 @@ legend{color:var(--green)}
 [hidden]{display:none!important}
 .accent{color:#246e5e;border-color:#8bb5a8;background:#eef6f2;font-weight:600}
 .cloudreview{font-size:11px;display:flex;align-items:center;gap:6px;white-space:nowrap}#cloudReview{display:flex;gap:3px}#cloudReview button{padding:5px 7px}#cloudReview [aria-pressed=true]{font-weight:700;box-shadow:inset 0 0 0 1px currentColor}#cloudKeep[aria-pressed=true]{color:#246e5e;border-color:#8bb5a8;background:#e8f3ee}#cloudPending[aria-pressed=true]{color:#926c21;border-color:#ccb77a;background:#fbf5e6}#cloudReject[aria-pressed=true]{color:#b54638;border-color:#dca599;background:#fbeeea}
+.reviewcontext{margin:0;padding:5px 10px;font-size:11px;line-height:1.5;color:var(--muted);background:var(--panel);border-bottom:1px solid var(--line);flex-shrink:0}.reviewcontext.stale{color:#926c21}
 #exportMessage{color:var(--danger);overflow-wrap:anywhere}#exportMessage:empty{display:none}#exportEligibility{font-size:11px}
 .frame[data-decision=reject]{opacity:.65}.frame[data-decision=keep] .chips{color:#246e5e}
 #exportTree{max-height:140px}#exportName{width:100%}
@@ -131,7 +132,7 @@ legend{color:var(--green)}
 .currentidentity{display:flex;align-items:center;gap:6px;flex:1;min-width:0}.currentidentity strong{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.currentidentity .tag{font-size:9px;padding:3px 5px}
 .capturebar .workflowbar{display:flex;align-items:center;gap:6px;padding:0;flex-shrink:0}.workflowbar [role=tablist]{display:flex;gap:3px}.workflowbar [role=tab]{font-size:12px;padding:6px 8px}
 .capturebar #alignmentStatus{display:none}.capturebar .vieweractions{display:flex;align-items:center;flex-wrap:nowrap;gap:6px}.capturebar .vieweractions button{font-size:11px;padding:6px 8px}.capturebar .autonext{order:5;margin-left:0}
-@media(max-width:1200px){.currentidentity .tag{display:none}.capturebar{gap:6px;padding:6px 8px}.cloudreview{gap:4px;font-size:10px}.workflowbar [role=tab]{font-size:11px;padding:6px}.capturebar .vieweractions{gap:4px}.capturebar #coordinateFrame{max-width:100px}}
+@media(max-width:1200px){.currentidentity .tag{display:none}.capturebar{gap:6px;padding:6px 8px}.cloudreview{gap:4px;font-size:10px}.workflowbar [role=tab]{font-size:11px;padding:6px}.capturebar .vieweractions{gap:4px}}
 @media(max-width:1400px){.sub{display:none}header{gap:12px}header nav button{padding:7px 9px;font-size:12px}#datasetSummary{font-size:11px}}
 @media(max-width:1100px){.brandtitle h1{font-size:16px}.logo{display:none}.vieweractions{gap:4px!important}.vieweractions button{padding:5px 7px;font-size:11px}.workflowbar{gap:7px;padding:5px 10px}.viewerhead{padding:6px 10px}header{padding:8px 12px}header nav{gap:5px}}
 @media(max-width:1200px){.sub{display:none}header{gap:12px;padding:8px 14px}header nav{gap:6px}header nav button{padding:7px 9px;font-size:12px}#datasetSummary{max-width:135px;font-size:11px}main{grid-template-columns:210px minmax(0,1fr)}}

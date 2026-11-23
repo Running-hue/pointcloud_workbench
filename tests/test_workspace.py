@@ -122,6 +122,23 @@ class WorkspaceTest(unittest.TestCase):
             state = self.ws.load({'source': str(self.source), 'segmentation': str(self.seg)})
             self.assertEqual(state['frames'][0]['camera']['type'], kind)
 
+    def test_legacy_screening_requires_version_confirmation(self):
+        generated = self.generate()
+        frame = self.ws.state()['frames'][0]
+        self.ws.review_cloud({'dataset_id': self.ws.dataset_id, 'id': frame['id'], 'decision': 'keep'})
+        settings = read_json(self.ws.state_dir/'settings.json')
+        record = settings['cloud_reviews'][str(generated)][self.rel]
+        record['schema_version'] = 1
+        record.pop('processing_version')
+        write_json(self.ws.state_dir/'settings.json', settings)
+        restored = Workspace(self.ws.state_dir)
+        row = restored.state()['frames'][0]
+        self.assertEqual(row['cloud_decision'], 'pending')
+        self.assertTrue(row['cloud_review_stale'])
+        restored.review_cloud({'dataset_id': restored.dataset_id, 'id': row['id'], 'decision': 'keep'})
+        self.assertFalse(restored.state()['frames'][0]['cloud_review_stale'])
+        self.assertEqual(Workspace(self.ws.state_dir).state()['frames'][0]['cloud_decision'], 'keep')
+
     def test_grouped_full_export_copies_rejected_cloud_and_validates_manifest_paths(self):
         generated=self.generate();frame=self.ws.state()['frames'][0]
         self.ws.review_cloud({'dataset_id':self.ws.dataset_id,'id':frame['id'],'decision':'reject'})

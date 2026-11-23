@@ -4,6 +4,7 @@
 # Python 运行缓存
 __pycache__/
 *.py[cod]
+.venv/
 
 # 本机目录设置、筛选状态和对齐缓存
 /.state/

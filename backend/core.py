@@ -11,8 +11,9 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from .paths import SHARED_DEPENDENCY_DIR
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'segmentation_workbench' / '.deps'))
+sys.path.insert(0, str(SHARED_DEPENDENCY_DIR))
 import cv2
 import numpy as np
 from PIL import Image

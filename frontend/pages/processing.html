@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>点云清理</title><link rel="stylesheet" href="/processing.css"></head>
+<body>
+<div class="tools" role="toolbar" aria-label="点云视图">
+  <select id="coordinate" aria-label="点云坐标系"><option value="camera">相机坐标</option><option value="body">猪体坐标</option></select>
+  <button data-view="top">正视</button><button data-view="side">侧视</button><button data-view="rear">另一侧</button><button data-view="oblique">斜视</button>
+  <select id="fit" aria-label="取景范围"><option value="body">主体视野</option><option value="full">全部点</option><option value="selected">选中点</option></select>
+  <button id="resetView">重置视角</button><button id="sourceImage">原图定位</button><button id="reloadData">重新载入</button>
+  <button id="togglePanel" aria-expanded="true" aria-controls="processingPanel">隐藏工具</button>
+</div>
+<main>
+  <div class="view"><canvas id="cloud" aria-label="可旋转的点云及疑似飞点"></canvas>
+    <div class="viewbadge" id="viewBadge">正在载入…</div>
+    <div class="hint" id="viewHint">拖动旋转 · 滚轮缩放 · Shift 拖动平移 · 双击重置</div>
+  </div>
+  <aside id="processingPanel">
+    <section class="summary"><h2 id="summaryTitle">点云查看与清理</h2><div id="counts"></div><p id="alignmentHint" class="muted"></p><p id="originalQuality" class="muted"></p></section>
+    <details id="cleaningSection" open><summary>保守清理</summary><div class="sectionbody">
+      <label>检测方式<select id="method"><option value="far">远离主体的点</option><option value="neighbor">邻域稀疏的点</option><option value="both">合并两类候选</option></select></label>
+      <div class="twocol"><label>主体外扩 / mm<input id="margin" type="number" min="50" max="2000" step="50" value="300"></label><label>邻域下限 / mm<input id="neighborDistance" type="number" min="5" max="500" value="50"></label></div>
+      <label id="neighborLabel">邻居数量<input id="neighbors" type="number" min="3" max="64" value="8"></label>
+      <button id="detect" class="primary">检测并高亮候选</button>
+      <p class="muted">红色为候选，不会自动删除。轮廓和端点处请结合原图检查。</p>
+      <div class="twocol"><button id="boxRemove" aria-pressed="false">框选删除</button><button id="boxRestore" aria-pressed="false">框选恢复</button></div>
+      <label class="check"><input id="showRemoved" type="checkbox">显示已删除点（灰色）</label>
+      <p id="selectionNotice" class="notice" hidden>框选贯穿当前视角的前后所有点。完成框选后可转动核对，再确认。</p>
+      <div id="candidateInfo" class="candidate">尚未选择点</div>
+      <div class="twocol"><button id="applySelection" class="danger" disabled>确认删除选中点</button><button id="clearSelection" disabled>取消选点</button></div>
+      <div class="history"><button id="undo" disabled>撤销</button><button id="redo" disabled>重做</button><button id="restoreAll" disabled>恢复全部</button></div>
+      <p class="muted">确认修改后自动暂存；原始点云保留。顶部“导出点云成果”保存清理结果和操作历史。</p>
+    </div></details>
+    <details id="measurementSection"><summary>对齐后的切片复核</summary><div class="sectionbody">
+      <p id="measurementLock" class="notice">请先在顶部“坐标对齐”中确认地面、尾根和颈根，再进行测量复核。</p>
+      <div id="measurementControls" hidden>
+        <div class="twocol"><label>切片厚度 / mm<input id="thickness" type="number" min="5" max="100" value="15"></label><label>最少点数<input id="minPoints" type="number" min="3" max="500" value="20"></label></div>
+        <button id="buildSlices">应用参数并查看切片</button>
+        <p class="muted">点数充足仅表示可以计算；仍需确认左右可见边界。改参数或删点后，切片确认状态会重置。</p>
+        <div class="slicenav"><button id="prevSlice" aria-label="上一切片">‹</button><input id="sliceSlider" type="range" min="0" max="0" value="0" aria-label="切片位置"><button id="nextSlice" aria-label="下一切片">›</button></div>
+        <div id="sliceLabel"></div><canvas id="slicePlot" aria-label="当前切片的左右方向与地面法向剖面"></canvas><p id="sliceInfo"></p>
+        <div class="reviewbuttons"><button id="sliceUsable">边界完整·可测</button><button id="sliceUnusable">缺边/缺深·不可测</button><button id="slicePending">待定</button></div>
+        <label class="check"><input id="autoNextSlice" type="checkbox" checked>标记后查看下一片</label>
+        <div id="featureSummary"></div>
+        <label>测量备注<textarea id="notes" rows="2" maxlength="2000" placeholder="记录端点、边缘缺失或其他测量限制"></textarea></label><button id="saveNotes">保存备注</button>
+        <p class="muted">三段最大宽度与 W25/W50/W75 分别记录。未确认值只作候选；不补洞、不把可见跨度当胸围。</p>
+      </div>
+    </div></details>
+    <div id="offlineFiles" hidden><a href="cleaned_points.npz">清理后相机坐标 NPZ</a><br><a href="measurement_summary.json">测量汇总</a> · <a href="pointcloud_cleaning.json">清理记录</a><br><a id="bodyFile" href="cleaned_body_points.npz">清理后猪体坐标 NPZ</a> · <a id="sliceFile" href="slice_measurements.csv">切片表</a></div>
+  </aside>
+</main>
+<div id="message" role="status" aria-live="polite"></div>
+<dialog id="imageDialog"><div class="dialoghead"><h2>分割底图上的位置</h2><button id="closeImage" aria-label="关闭原图定位">×</button></div><p id="imageHint"></p><div class="imagewrap"><canvas id="imageCanvas"></canvas></div></dialog>
+<script>const APP_TOKEN='__TOKEN__';</script><script src="/processing.js"></script>
+</body></html>

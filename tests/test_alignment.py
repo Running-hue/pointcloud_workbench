@@ -376,10 +376,12 @@ class AlignmentWorkflowTest(unittest.TestCase):
         confirmed=self.ws.alignment.confirm({**self.payload,'candidate_id':fitted['candidate_id'],
             'alignment_confirmed':True})
         self.assertTrue(confirmed['cached'])
-        self.assertEqual(confirmed['cloud_decision'],'keep')
-        self.assertEqual(self.ws.row(self.base['id'])['cloud_decision'],'keep')
+        self.assertEqual(confirmed['cloud_decision'],'pending')
+        self.assertEqual(self.ws.row(self.base['id'])['cloud_decision'],'pending')
+        self.assertTrue(self.ws.row(self.base['id'])['cloud_review_stale'])
         portable=read_json(Path(confirmed['output'])/self.rel/'cloud_review.json')
-        self.assertEqual(portable['decision'],'keep')
+        self.assertEqual(portable['decision'],'pending')
+        self.assertIsNone(portable['reviewed_at'])
         self.assertEqual(portable['points_sha256'],sha256(self.folder/'points.npz'))
         self.assertTrue(Path(confirmed['output']).is_relative_to(self.ws.state_dir/'alignment_cache'))
         self.assertEqual(self.ws.state()['export_parent'],export_parent)
@@ -387,7 +389,7 @@ class AlignmentWorkflowTest(unittest.TestCase):
         restored=Workspace(self.ws.state_dir,initial_results=self.results)
         rows=restored.state()['frames']
         self.assertTrue(rows[0]['alignment_cached'])
-        self.assertEqual(rows[0]['cloud_decision'],'keep')
+        self.assertEqual(rows[0]['cloud_decision'],'pending')
         ctx=restored.alignment.context({'dataset_id':restored.dataset_id,'id':rows[0]['id']})
         self.assertTrue(ctx['saved_alignment']['confirmed'])
         for row,decision in zip(rows,('keep','reject','pending')):
@@ -410,7 +412,7 @@ class AlignmentWorkflowTest(unittest.TestCase):
         from unittest.mock import patch
         fitted=self.fit()
         payload={**self.payload,'candidate_id':fitted['candidate_id']}
-        with self.assertRaisesRegex(ValueError,'确认对齐并保留'):
+        with self.assertRaisesRegex(ValueError,'确认坐标对齐'):
             self.ws.alignment.confirm(payload)
         self.ws.review_cloud({**self.base,'decision':'reject'})
         original_folder=self.ws.results[self.rel]['folder']

@@ -18,19 +18,75 @@ from .core import (independent_paths, within, read_json, write_json, sha256, rec
                    COMMON_RESULT_FILES, export_metadata, EXPORT_POLICY, camera_identity, np)
 from .viewer import write_viewer
 from .alignment import AlignmentService, SIDE_FILES, alignment_status, render_body_view
+from .processing import ProcessingService, PROCESSING_FILES
+from .paths import DEFAULT_OUTPUT_ROOT
 
 RESULT_FILES = {'points.npz', 'cloud_rgb_mm.ply', 'cloud_ir_mm.ply', 'pointcloud.json',
                 'preview.html', 'mask_depth_check.png', 'rgb_projection_check.png',
-                'rgb_registration_check.png', 'cloud_review.json'} | SIDE_FILES
+                'rgb_registration_check.png', 'cloud_review.json', 'current_pointcloud.json'} | SIDE_FILES | PROCESSING_FILES
 REVIEW_GROUPS = {'keep': '保留', 'pending': '待定', 'reject': '淘汰'}
 
 
 def valid_cloud_review(record, folder, relative_dir, report):
-    return (isinstance(record, dict) and record.get('schema_version') == 1
+    return (isinstance(record, dict) and record.get('schema_version') in {1, 2}
             and record.get('decision') in {'keep', 'pending', 'reject'}
             and record.get('relative_dir') == relative_dir
             and record.get('input_mode') == input_mode(report)
             and record.get('points_sha256') == sha256(folder/'points.npz'))
+
+
+def processing_version(result):
+    """Point membership and body reference, independent of notes/save timestamps."""
+    record = result.get('processing', {}).get('record', {})
+    return {'cleaning_digest': record.get('cleaning_digest', '') if record.get('removed_points', 0) else '',
+            'alignment_reference_id': result.get('alignment_reference_id', '') if result.get('has_alignment') else ''}
+
+
+def cloud_review_state(result):
+    record = result.get('cloud_review')
+    stale = bool(record and (record.get('schema_version') != 2
+                            or record.get('processing_version') != processing_version(result)))
+    return {'cloud_decision': record['decision'] if record and not stale else 'pending',
+            'cloud_review_stale': stale}
+
+
+def current_cloud(result):
+    """The same full-density version used by processing and folder exports."""
+    processed, aligned = bool(result.get('processing')), bool(result.get('has_alignment'))
+    record = result.get('processing', {}).get('record', {})
+    return {'current_ply': 'cloud_cleaned_body_mm.ply' if processed and aligned else
+            'cloud_body_mm.ply' if aligned else 'cloud_cleaned_mm.ply' if processed else primary_ply(result['report']),
+            'current_npz': 'cleaned_body_points.npz' if processed and aligned else
+            'body_points.npz' if aligned else 'cleaned_points.npz' if processed else 'points.npz',
+            'current_coordinates': 'ground_body' if aligned else 'native_depth_camera',
+            'current_points': result['report']['stats']['points']-record.get('removed_points', 0)}
+
+
+def measurement_state(result):
+    record = result.get('processing', {}).get('record', {})
+    m = record.get('measurement', {})
+    version = processing_version(result)
+    valid = (result.get('has_alignment') and m.get('reference_id') == version['alignment_reference_id']
+             and m.get('cleaning_digest') == record.get('cleaning_digest'))
+    summary = m.get('review_summary', {}) if valid else {}
+    return {'measurement_ready': summary.get('measurement_ready') is True,
+            'measurement_usable_slices': summary.get('usable_slices', 0),
+            'measurement_slice_count': summary.get('slice_count', 0)}
+
+
+def write_current_cloud(folder, result, decision):
+    current = {**current_cloud(result), **measurement_state(result)}
+    if (folder/'measurement_summary.json').is_file():
+        summary = read_json(folder/'measurement_summary.json')
+        current.update(measurement_ready=summary.get('measurement_ready') is True,
+            measurement_usable_slices=summary.get('usable_slices', 0),
+            measurement_slice_count=summary.get('slice_count', 0))
+    if not all((folder/current[k]).is_file() for k in ('current_ply', 'current_npz')):
+        raise ValueError('当前处理版本的主点云文件缺失，未导出本采集')
+    write_json(folder/'current_pointcloud.json', {**current, 'schema_version': 1, 'unit': 'mm',
+        'processing_version': processing_version(result), 'cloud_decision': decision,
+        'definition': 'current full-density version; originals included for traceability; keep is not measurement acceptance'})
+    return current
 
 
 def write_cloud_review(folder, result):
@@ -40,6 +96,10 @@ def write_cloud_review(folder, result):
     if record:
         if not valid_cloud_review(record, folder, record['relative_dir'], result['report']):
             raise ValueError('点云在筛选后发生变化，请重新核对保留／待定／淘汰状态')
+        if cloud_review_state(result)['cloud_review_stale']:
+            record = {**cloud_review_record(result, record['relative_dir'], 'pending'),
+                      'reviewed_at': None, 'previous_review': record,
+                      'reason': '处理版本已变化或旧记录未绑定版本，需重新确认采集筛选'}
         write_json(path, record)
     elif path.exists():
         path.unlink()
@@ -49,8 +109,10 @@ def cloud_review_record(result, relative_dir, decision):
     points = result['folder']/'points.npz'
     if points.is_symlink() or not points.is_file():
         raise ValueError('当前点云文件不存在或路径不合法')
-    return {'schema_version': 1, 'decision': decision, 'relative_dir': relative_dir,
+    return {'schema_version': 2, 'decision': decision, 'relative_dir': relative_dir,
             'input_mode': input_mode(result['report']), 'points_sha256': sha256(points),
+            'processing_version': processing_version(result),
+            'scope': 'current full-density point set and body reference; not measurement acceptance',
             'reviewed_at': datetime.now().astimezone().isoformat()}
 
 
@@ -188,6 +250,7 @@ class Workspace:
         self.warning = ''
         self.settings = {}
         self.alignment = AlignmentService(self)
+        self.processing = ProcessingService(self)
         settings_file = self.state_dir/'settings.json'
         if settings_file.is_file():
             try:
@@ -283,11 +346,15 @@ class Workspace:
                 row.update(has_cloud=True, points=r['stats']['points'], cloud_reviewed=r.get('reviewed', False),
                            cloud_input_mode=input_mode(r), cloud_ply=primary_ply(r),
                            cloud_camera=r.get('camera', {}),
-                           cloud_decision=result.get('cloud_review', {}).get('decision', 'pending'),
+                           **cloud_review_state(result), **current_cloud(result), **measurement_state(result),
                            has_alignment=result.get('has_alignment', False),
                            alignment_cached=result.get('alignment_cached', False),
                            alignment_revision=result.get('alignment_revision', ''),
                            alignment_output=str(result['folder']) if result.get('has_alignment') else '',
+                           has_cleaning=bool(result.get('processing')),
+                           processing_revision=result.get('processing', {}).get('record', {}).get('revision', ''),
+                           cleaning_digest=result.get('processing', {}).get('record', {}).get('cleaning_digest', ''),
+                           removed_points=result.get('processing', {}).get('record', {}).get('removed_points', 0),
                            infrared_available=r.get('infrared_available', True),
                            has_ir_file=(result['folder']/'cloud_ir_mm.ply').is_file())
             frames = list(merged.values())
@@ -306,7 +373,7 @@ class Workspace:
                     'aligned': sum(r.get('has_alignment', False) for r in self.results.values()),
                     'results_match_inputs': self.results_match_inputs,
                     'alignment_source': self.settings.get('alignment_sources', {}).get(str(self.results_root), '') or str(self.source or self.settings.get('source', '')),
-                    'export_parent': self.settings.get('export_parent', str(Path(__file__).resolve().parents[1]/'outputs')),
+                    'export_parent': self.settings.get('export_parent', str(DEFAULT_OUTPUT_ROOT)),
                     'suggested_name': '点云成果_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:19],
                     'job': copy.deepcopy(self.job), 'warning': self.warning,
                     'validation': self.validation_report()['summary']}
@@ -394,7 +461,10 @@ class Workspace:
                 raise ValueError('该目录的点云不是当前毫米相机坐标格式')
             if rel in results:
                 raise ValueError('点云成果含重复采集，请分别打开成果目录')
-            results[rel] = {'folder': folder, 'report': report, 'has_alignment': alignment_status(folder)}
+            aligned = alignment_status(folder)
+            results[rel] = {'folder': folder, 'report': report, 'has_alignment': aligned,
+                            'alignment_reference_id': read_json(folder/'alignment.json')['reference_id'] if aligned else '',
+                            'alignment_revision': sha256(folder/'alignment.json') if aligned else ''}
         if not results: raise ValueError('目录中没有完整点云成果，请选择包含 pig_编号/采集时间 的点云根目录')
         results = dict(sorted(results.items()))
         with self.lock:
@@ -420,6 +490,7 @@ class Workspace:
                         raise ValueError('对齐成果与原点云不匹配')
                     results[rel] = {**results[rel], 'folder': aligned, 'has_alignment': True,
                                     'alignment_cached': entry.get('cached') is True,
+                                    'alignment_reference_id': read_json(aligned/'alignment.json')['reference_id'],
                                     'alignment_revision': sha256(aligned/'alignment.json')}
                 except (ValueError, OSError, KeyError, TypeError):
                     invalid += 1
@@ -437,6 +508,7 @@ class Workspace:
                 except (ValueError, OSError, KeyError, TypeError):
                     review_invalid += 1
             self.results, self.results_root = results, root
+            processing_invalid = self.processing.restore()
             # Equal relative paths can occur in different cameras and segmentation
             # jobs. Opening results must not authorize generation from other inputs.
             self.results_match_inputs = bool(self.source and self.segmentation)
@@ -451,6 +523,8 @@ class Workspace:
             self.warning = f'{invalid} 次已保存对齐成果缺失或与原点云不匹配，已退回相机点云，请重新对齐。' if invalid else ''
             if review_invalid:
                 self.warning += f' {review_invalid} 次点云筛选记录与当前文件不匹配，已恢复为待定。'
+            if processing_invalid:
+                self.warning += f' {processing_invalid} 份清理记录无法匹配或已损坏，未应用；请在清理页复核。'
             if remember:
                 self.settings['results'] = str(root)
                 self.remember()
@@ -465,6 +539,7 @@ class Workspace:
             'input_report_sha256': ctx['input_report_sha256'], 'cached': cached}
         self.results[rel] = {**self.results[rel], 'folder': dest, 'has_alignment': True,
                              'alignment_cached': cached,
+                             'alignment_reference_id': read_json(dest/'alignment.json')['reference_id'],
                              'alignment_revision': sha256(dest/'alignment.json')}
 
     def row(self, frame_id):
@@ -572,6 +647,7 @@ class Workspace:
                 if self.stop_event.is_set(): break
                 rel = row['relative_dir']
                 storage = (Path(REVIEW_GROUPS[row['cloud_decision']])/rel).as_posix() if self.job['group_by_decision'] else rel
+                dest = within(stage, storage)
                 with self.lock: self.job['current'] = rel
                 try:
                     if mode == 'generate':
@@ -606,7 +682,7 @@ class Workspace:
                                 pass
                         other = 'cloud_ir_mm.ply' if input_mode(report) == 'rgb' else 'cloud_rgb_mm.ply'
                         if (dest/other).exists(): (dest/other).unlink()
-                        if normalized != report and not source.get('has_alignment'):
+                        if normalized != report and not source.get('has_alignment') and not source.get('processing'):
                             write_json(dest/'pointcloud.json', normalized)
                         # Folder exports use the current layout/theme even when
                         # the measured point data and metadata need no upgrade.
@@ -616,10 +692,14 @@ class Workspace:
                             with np.load(dest/'body_points.npz', allow_pickle=False) as data:
                                 (dest/'body_preview.html').write_text(render_body_view(data, read_json(dest/'alignment.json')), encoding='utf-8')
                         write_cloud_review(dest, source)
+                        self.processing.export_to(dest, source)
                         if self.job.get('aligned_only') and not alignment_status(dest):
                             raise ValueError('复制后的对齐成果不完整或校验不匹配，请重新核对后导出')
                         report = normalized
-                    completed.append(({**row, 'storage_relative_dir': storage}, report))
+                    exported_result = source if mode == 'export' else {'report': report}
+                    current = write_current_cloud(dest, exported_result,
+                        row.get('cloud_decision', 'pending') if mode == 'export' else 'pending')
+                    completed.append(({**row, **current, 'storage_relative_dir': storage}, report))
                     with self.lock: self.job['success'] += 1
                 except SkipCapture as exc:
                     with self.lock: self.job['skipped'].append({'relative_dir': rel, 'reason': str(exc)})
@@ -641,13 +721,17 @@ class Workspace:
                 detail = reason.get('error') or reason.get('reason') or '没有完成任何采集'
                 raise ValueError('没有生成或导出成功的点云；首项原因：'+detail+'。目标文件夹未创建，详见逐项记录')
             status = 'stopped' if self.stop_event.is_set() else ('completed_with_errors' if self.job['errors'] else 'completed')
+            coordinates = {row['current_coordinates'] for row, _ in completed}
             manifest = {'schema_version': 1, 'source': str(self.source or ''), 'segmentation': str(self.segmentation or ''),
-                        'output': str(target), 'coordinate_system': 'native_depth_camera', 'unit': 'mm',
+                        'output': str(target), 'coordinate_system': next(iter(coordinates)) if len(coordinates) == 1 else 'per_frame',
+                        'original_coordinate_system': 'native_depth_camera', 'unit': 'mm',
                         'export_policy': EXPORT_POLICY,
                         'frames': [{**row, 'has_cloud': True, 'input_mode': input_mode(report),
-                                    'primary_ply': primary_ply(report), 'camera': report.get('camera', {}),
+                                    'primary_ply': row['current_ply'], 'primary_npz': row['current_npz'],
+                                    'original_primary_ply': primary_ply(report), 'camera': report.get('camera', {}),
                                     'reviewed': report['reviewed'], 'points': report['stats']['points'],
                                     'has_alignment': alignment_status(within(stage, row['storage_relative_dir'])),
+                                    'has_cleaning': (within(stage, row['storage_relative_dir'])/'pointcloud_cleaning.json').is_file(),
                                     'cloud_decision': row.get('cloud_decision', 'pending') if mode == 'export' else 'pending'} for row, report in completed]}
             manifest['aligned_only'] = self.job['aligned_only']
             manifest['group_by_decision'] = self.job['group_by_decision']
@@ -655,6 +739,7 @@ class Workspace:
             write_json(stage/'pointcloud_dataset.json', manifest)
             if mode == 'export':
                 exported = {row['relative_dir']: row['storage_relative_dir'] for row, _ in completed}
+                completed_rows = {row['relative_dir']: row for row, _ in completed}
                 screening = []
                 for row in review_scope:
                     decision = row.get('cloud_decision', 'pending')
@@ -667,6 +752,11 @@ class Workspace:
                         'capture_id': row['capture_id'], 'input_mode': row.get('cloud_input_mode') or row.get('input_mode'),
                         'decision': decision, 'status': {'keep':'保留','pending':'待定','reject':'淘汰'}[decision],
                         'has_alignment': row.get('has_alignment', False), 'exported': row['relative_dir'] in exported,
+                        'has_cleaning': row.get('has_cleaning', False), 'removed_points': row.get('removed_points', 0),
+                        **{k: row.get(k, '') for k in ('current_ply', 'current_npz', 'current_coordinates', 'current_points')},
+                        'cloud_review_stale': row.get('cloud_review_stale', False),
+                        **{k: completed_rows.get(row['relative_dir'], row).get(k, False if k == 'measurement_ready' else 0)
+                           for k in ('measurement_ready', 'measurement_usable_slices', 'measurement_slice_count')},
                         'storage_relative_dir': exported.get(row['relative_dir'], ''),
                         'reason': reason})
                 write_json(stage/'cloud_screening.json', {'schema_version': 1, 'results': str(self.results_root),
@@ -679,7 +769,7 @@ class Workspace:
                 write_json(stage/'input_validation.json', self.validation_report())
             final_job = {**copy.deepcopy(self.job), 'status': status, 'current': '已按原相对目录保存全部成果'}
             write_json(stage/'export.json', final_job)
-            links = ''.join(f'<li><a href="{quote(row["storage_relative_dir"], safe="/")}/{"body_preview.html" if row["has_alignment"] else "preview.html"}">{escape(row["storage_relative_dir"])}</a> · {row["points"]:,} 点</li>' for row in manifest['frames'])
+            links = ''.join(f'<li><a href="{quote(row["storage_relative_dir"], safe="/")}/{"processing_preview.html" if row.get("has_cleaning") else "body_preview.html" if row["has_alignment"] else "preview.html"}">{escape(row["storage_relative_dir"])}</a> · 主点云 <a href="{quote(row["storage_relative_dir"], safe="/")}/{row["primary_ply"]}">{row["primary_ply"]}</a> · 当前 {row["current_points"]:,} 点 · {"测量已复核" if row["measurement_ready"] else "测量待复核"}</li>' for row in manifest['frames'])
             (stage/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>点云成果</title><style>body{font:16px system-ui;margin:40px;line-height:2}a{color:#167b6b}</style><h1>毫米点云成果</h1><p>每次采集的 PLY、NPZ、检查图和生成记录均保存在对应文件夹。</p><ul>'+links+'</ul>', encoding='utf-8')
             if target.exists() or target.is_symlink(): raise ValueError('目标文件夹已被创建，请换名重试')
             stage.rename(target)

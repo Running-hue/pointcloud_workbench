@@ -24,15 +24,18 @@ async function setup(initial = dataset) {
       addEventListener(name, fn) { this.listeners[name] = fn; },
       showModal() { this.open=true; }, close() { this.open=false; this.listeners.close?.(); }};
   }
-  for (const match of fs.readFileSync(path.join(app,'index.html'),'utf8').matchAll(/id="([^"]+)"/g)) {
+  for (const match of fs.readFileSync(path.join(app,'frontend','pages','index.html'),'utf8').matchAll(/id="([^"]+)"/g)) {
     elements.set(match[1], element());
   }
   elements.get('filter').value='all';
   for (const id of ['exportKeep','exportPending','exportReject']) elements.get(id).checked=true;
   const requests=[];
-  const listeners = {};
+  const listeners = {}, handlers = {};
   const sandbox = {APP_TOKEN:'test', URLSearchParams, Set, requestAnimationFrame:fn=>fn(), location:{origin:'http://localhost'},
-    setTimeout:()=>1, clearTimeout() {}, window:{addEventListener(name, fn) {listeners[name]=fn;}},
+    setTimeout:()=>1, clearTimeout() {}, window:{addEventListener(name, fn) {
+      (handlers[name] ||= []).push(fn);
+      listeners[name] = async event => { for (const handler of handlers[name]) await handler(event); };
+    }},
     document:{getElementById:id=>elements.get(id), createElement:element,
       querySelectorAll:()=>[], querySelector:selector=>selector.includes('scope') ? {value:'selected'} : null},
     fetch: async (url, options) => {
@@ -42,11 +45,15 @@ async function setup(initial = dataset) {
       return {ok:true, status:200, json:async()=>data};
     }};
   const context=vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(path.join(app,'workbench.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(app,'frontend','assets','js','workbench.js'),'utf8'),context);
   await settle();
   const notify = data => listeners.message({origin:'http://localhost',source:elements.get('alignmentEditor').contentWindow,
     data:{type:'pointcloud-alignment',dataset_id:'one',id:'1',...data}});
-  return {elements, requests, sandbox, listeners, notify, run:code=>vm.runInContext(code,context)};
+  const notifyProcessing = data => listeners.message({origin:'http://localhost',source:elements.get('processingEditor').contentWindow,
+    data:{type:'pointcloud-processing',dataset_id:'one',id:vm.runInContext('current',context),...data}});
+  // A real processing iframe sends this after its initial context has loaded.
+  await notifyProcessing({action:'busy',busy:false});
+  return {elements, requests, sandbox, listeners, notify, notifyProcessing, run:code=>vm.runInContext(code,context)};
 }
 
 test('reload with no selection offers reviewed captures and never includes drafts by default', async () => {
@@ -138,19 +145,22 @@ test('opening results selects a generated capture when current input has no clou
     has_cloud:true,points:100,cloud_input_mode:'infrared',cloud_ply:'cloud_ir_mm.ply'})]};
   ui.run(`accept(${JSON.stringify(data)})`);
   assert.equal(ui.run('current'),'2');
-  assert.equal(ui.elements.get('viewer').hidden,false);
+  assert.equal(ui.elements.get('processingEditor').hidden,false);
+  assert.match(ui.elements.get('processingEditor').src,/mode=cleaning/);
 });
 
-test('aligned exports open in the body frame and can switch back to the camera frame', async () => {
+test('cleaning and review share the point viewer with distinct workflow modes', async () => {
   const ui=await setup({...dataset,clouds:1,results:'/aligned',frames:[frame('1',{
     has_cloud:true,has_alignment:true,points:100,cloud_input_mode:'infrared'})]});
-  assert.equal(ui.elements.get('coordinateFrame').value,'body');
-  assert.match(ui.elements.get('viewer').src,/body_preview.html/);
-  ui.elements.get('coordinateFrame').value='camera';ui.elements.get('coordinateFrame').onchange();
-  assert.match(ui.elements.get('viewer').src,/file=preview.html/);
-  ui.run("state.frames[0].has_alignment=false; renderViewer();");
-  assert.equal(ui.elements.get('bodyCoordinate').disabled,true);
-  assert.equal(ui.elements.get('coordinateFrame').value,'camera');
+  assert.match(ui.elements.get('processingEditor').src,/mode=cleaning/);
+  assert.equal(ui.elements.has('viewer'),false);
+  ui.elements.get('reviewCurrent').onclick();
+  assert.match(ui.elements.get('processingEditor').src,/mode=review/);
+  assert.equal(ui.elements.get('reviewCurrent')['aria-selected'],'true');
+  await ui.notifyProcessing({action:'busy',busy:false});
+  ui.elements.get('cleanCurrent').onclick();
+  assert.match(ui.elements.get('processingEditor').src,/mode=cleaning/);
+  assert.equal(ui.elements.get('cleanCurrent')['aria-selected'],'true');
 });
 
 test('coordinate alignment stays in the workbench and switching views keeps the editor', async () => {
@@ -161,16 +171,17 @@ test('coordinate alignment stays in the workbench and switching views keeps the 
   assert.match(url,/^\/alignment\?/);assert.match(url,/dataset_id=one/);assert.match(url,/id=1/);
   assert.match(url,/embedded=1/);
   assert.equal(ui.elements.get('alignmentEditor').hidden,false);
-  assert.equal(ui.elements.get('viewer').hidden,true);
+  assert.equal(ui.elements.get('processingEditor').hidden,true);
   await ui.notify({action:'busy',busy:false});
-  ui.elements.get('viewCloud').onclick();
-  assert.equal(ui.elements.get('viewer').hidden,false);
+  ui.elements.get('cleanCurrent').onclick();
+  assert.equal(ui.elements.get('processingEditor').hidden,false);
   assert.equal(ui.elements.get('alignmentEditor').src,url);
+  await ui.notifyProcessing({action:'busy',busy:false});
   ui.elements.get('alignCurrent').onclick();
   assert.equal(ui.elements.get('alignmentEditor').src,url);
 });
 
-test('saving an inline alignment refreshes body viewing without replacing the capture list', async () => {
+test('saving an inline alignment preserves its editor and capture list for batch work', async () => {
   const initial={...dataset,clouds:2,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})]};
   const ui=await setup(initial);ui.elements.get('alignCurrent').onclick();
   await ui.notify({action:'busy',busy:false});
@@ -179,13 +190,45 @@ test('saving an inline alignment refreshes body viewing without replacing the ca
   await ui.notify({action:'saved',output:'/aligned'});
   assert.equal(ui.run('state.frames.length'),2);
   assert.equal(ui.run('state.results'),'/clouds');
-  assert.equal(ui.elements.get('coordinateFrame').value,'body');
   assert.equal(ui.elements.get('alignmentEditor').src,url);
-  assert.match(ui.elements.get('viewer').src,/body_preview.html.*alignment=new/);
+  assert.equal(ui.run('state.frames[0].alignment_revision'),'new');
+  assert.equal(ui.run('workspaceView'),'alignment');
   assert.equal(ui.elements.has('nextAlignment'),false);
   ui.run("selectCapture('2')");
   assert.equal(ui.run('current'),'2');
   assert.match(ui.elements.get('alignmentEditor').src,/id=2/);
+});
+
+test('review uses the confirmed reference and saving keeps the current editor context', async () => {
+  const initial={...dataset,clouds:1,results:'/clouds',frames:[frame('1',{
+    has_cloud:true,points:100,has_alignment:true,alignment_revision:'first'})]};
+  const ui=await setup(initial);
+  ui.elements.get('reviewCurrent').onclick();
+  await ui.notifyProcessing({action:'busy',busy:false});
+  const key=ui.run('processingKey');
+  ui.sandbox.reply=async()=>({...initial,frames:[{...initial.frames[0],has_cleaning:true,removed_points:3,cleaning_digest:'edited'}]});
+  await ui.notifyProcessing({action:'saved'});
+  assert.equal(ui.run('processingKey'),key);
+  assert.equal(ui.run('processingBusy'),false);
+  assert.equal(ui.run('state.frames[0].removed_points'),3);
+  ui.run("state.frames[0].alignment_revision='second'; renderViewer();");
+  assert.notEqual(ui.run('processingKey'),key);
+  assert.equal(ui.run('processingBusy'),true);
+});
+
+test('review remains reachable before alignment and changing captures clears its old context', async () => {
+  const initial={...dataset,clouds:2,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})]};
+  const ui=await setup(initial);
+  ui.elements.get('reviewCurrent').onclick();
+  assert.match(ui.elements.get('alignmentStatus').textContent,/尚未完成坐标对齐/);
+  assert.match(ui.elements.get('processingEditor').src,/id=1.*mode=review/);
+  await ui.notifyProcessing({action:'busy',busy:false});
+  ui.run("selectCapture('2')");
+  assert.match(ui.elements.get('processingEditor').src,/id=2.*mode=review/);
+  await ui.notifyProcessing({action:'busy',busy:false,id:'1'});
+  assert.equal(ui.run('processingBusy'),true);
+  await ui.notifyProcessing({action:'busy',busy:false,id:'2'});
+  assert.equal(ui.run('processingBusy'),false);
 });
 
 test('an editor load failure releases action locks and allows retry', async () => {
@@ -194,8 +237,9 @@ test('an editor load failure releases action locks and allows retry', async () =
   assert.equal(ui.run('alignmentBusy'),true);
   ui.elements.get('alignmentEditor').onerror();
   assert.equal(ui.run('alignmentBusy'),false);
+  assert.equal(ui.elements.get('processingEditor').hidden,false);
+  await ui.notifyProcessing({action:'busy',busy:false});
   assert.equal(ui.elements.get('generate').disabled,false);
-  assert.equal(ui.elements.get('viewer').hidden,false);
   ui.elements.get('alignCurrent').onclick();
   assert.equal(ui.elements.get('alignmentEditor').hidden,false);
 });
@@ -278,7 +322,7 @@ test('empty filtered lists clear the viewer and refresh generation availability'
   const ui=await setup({...dataset,frames:[frame('one',{camera:{type:'itof'},input_mode:'rgb'})]});
   ui.elements.get('cameraFilter').value='stereo';ui.elements.get('cameraFilter').onchange();
   assert.equal(ui.run('current'),null);
-  assert.equal(ui.elements.get('viewer').hidden,true);
+  assert.equal(ui.elements.get('processingEditor').hidden,true);
   assert.equal(ui.elements.get('generate').disabled,true);
 });
 
@@ -314,7 +358,8 @@ test('aligned export includes all three selected review states in separate folde
   const ui=await setup({...dataset,frames,clouds:4,results:'/clouds'});
   ui.elements.get('export').onclick();
   assert.equal(ui.elements.has('exportAligned'),false);
-  assert.equal(ui.elements.get('exportContent').value,'aligned');
+  assert.equal(ui.elements.get('exportContent').value,'all');
+  ui.elements.get('exportContent').value='aligned';ui.elements.get('exportContent').onchange();
   assert.equal(ui.elements.get('exportDialog').open,true);
   assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','2','3']);
   for (const label of ['保留/','待定/','淘汰/']) assert.ok(ui.elements.get('exportTree').textContent.includes(label));
@@ -347,6 +392,44 @@ test('full export also groups pending and rejected clouds and enforces review ch
   assert.match(ui.elements.get('exportEligibility').textContent,/至少勾选/);
 });
 
+test('capture screening context and exported primary files agree across all three steps', async () => {
+  const row=frame('1',{has_cloud:true,points:100,has_alignment:true,has_cleaning:true,removed_points:10,
+    cloud_decision:'pending',cloud_review_stale:true,measurement_slice_count:12,measurement_usable_slices:3});
+  const ui=await setup({...dataset,frames:[row],clouds:1,results:'/clouds'});
+  ui.run("selected.add('1')");
+  for (const view of ['cleaning','alignment','review']) {
+    ui.run(`setWorkspaceView('${view}'); alignmentBusy=false; processingBusy=false; controls();`);
+    assert.match(ui.elements.get('cloudReviewHint').textContent,/本次采集.*处理后点集.*猪体坐标/);
+    assert.match(ui.elements.get('cloudReviewHint').textContent,/3\/12 片/);
+    assert.match(ui.elements.get('cloudReviewHint').textContent,/重新确认/);
+    assert.equal(ui.elements.get('cloudPending')['aria-pressed'],'true');
+    ui.elements.get('export').onclick();
+    assert.equal(ui.elements.get('exportContent').value,'all');
+    assert.match(ui.elements.get('exportTree').textContent,/主点云：cloud_cleaned_body_mm.ply · cleaned_body_points.npz/);
+    assert.match(ui.elements.get('exportTree').textContent,/current_pointcloud.json/);
+    assert.match(ui.elements.get('exportEligibility').textContent,/测量已复核 0 次/);
+    ui.elements.get('exportDialog').close();
+  }
+  ui.run("state.frames[0].has_alignment=false; renderViewer(); alignmentBusy=false; processingBusy=false;");
+  ui.elements.get('export').onclick();
+  assert.match(ui.elements.get('exportTree').textContent,/主点云：cloud_cleaned_mm.ply · cleaned_points.npz/);
+  assert.match(ui.elements.get('exportTree').textContent,/相机坐标/);
+});
+
+test('export jobs lock the current editor without reloading its context against a busy workspace', async () => {
+  const row=frame('1',{has_cloud:true,points:100,has_cleaning:true,removed_points:10});
+  const ui=await setup({...dataset,frames:[row],clouds:1,results:'/clouds'});
+  const key=ui.run('processingKey'), src=ui.elements.get('processingEditor').src;
+  ui.run("accept({...state,job:{id:'export-1',mode:'export',status:'running',done:0,total:1,success:0,skipped:[],errors:[]}})");
+  assert.equal(ui.run('processingKey'),key);
+  assert.equal(ui.elements.get('processingEditor').src,src);
+  assert.equal(ui.elements.get('processingEditor').inert,true);
+  ui.run("accept({...state,job:{...state.job,status:'completed',done:1,success:1}})");
+  assert.equal(ui.run('processingKey'),key);
+  assert.equal(ui.run('processingBusy'),false);
+  assert.equal(ui.elements.get('processingEditor').inert,false);
+});
+
 test('alignment hides input skip action while pending and reject remain directly editable', async () => {
   const row=frame('1',{has_cloud:true,points:100});
   const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[row]});
@@ -359,7 +442,7 @@ test('alignment hides input skip action while pending and reject remain directly
     assert.equal(ui.run('state.frames[0].cloud_decision'),decision);
     assert.equal(ui.run('state.frames[0].has_alignment'),undefined);
   }
-  ui.elements.get('viewCloud').onclick();
+  ui.elements.get('cleanCurrent').onclick();
   assert.equal(ui.elements.get('toggleExcluded').hidden,false);
 });
 

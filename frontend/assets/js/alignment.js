@@ -37,7 +37,7 @@ function restoreConfirmed(result){
  polygon=record.annotations.ground_polygon;tail=record.annotations.tail.pixel_uv_native;neck=record.annotations.neck.pixel_uv_native;
  $('threshold').value=record.ground_quality.threshold_mm;draw();
  saved={cached:result.alignment_cached,reference_id:record.reference_id};
- $('preview').src='/api/media?'+new URLSearchParams({...base,file:'body_preview.html',revision:record.reference_id});
+ $('preview').src='/api/media?'+new URLSearchParams({...base,file:'body_preview.html',cleaned:'1',revision:record.reference_id});
  $('preview').hidden=false;$('previewEmpty').hidden=true;$('checkImage').src=result.saved_check_image;$('checkDetails').hidden=false;
  $('saved').hidden=false;
  $('referenceStatus').textContent=result.alignment_cached?'本条已确认 · 待统一导出':'已保存对齐';showQuality(record);
@@ -54,7 +54,7 @@ async function load(){
  $('identity').textContent=`${result.camera?.model||''} · 耳标 ${result.pig_id} / ${result.capture_id} · ${result.input_mode==='rgb'?'RGB':'IR'} 分割`;
  $('referenceStatus').textContent=result.reference?'同次采集已有确认参考，可直接复用':'尚未计算';
  const restored=restoreDraft();$('toolHint').textContent=hints[tool];await showImage();focusPig();if($('sourceDialog').open)$('sourceDialog').close();
- if(restored){$('referenceStatus').textContent='已恢复未确认标注，需重新计算';message('已恢复本次采集的标注；请重新计算、核对后点击“确认对齐并保留”。');return}
+ if(restored){$('referenceStatus').textContent='已恢复未确认标注，需重新计算';message('已恢复本次采集的标注；请重新计算、核对后点击“确认坐标对齐”。');return}
  if(restoreConfirmed(result))return;
  message('已放大猪体附近；滚轮缩放，空格＋拖动，点击“全景”查看完整地面。');
 }
@@ -85,11 +85,11 @@ $('save').onclick=()=>action(async()=>{
  saved=await api('alignment/confirm',{context_id:context.context_id,candidate_id:candidate.candidate_id,
   alignment_confirmed:true});
  context.reference=true;
- $('preview').src='/api/media?'+new URLSearchParams({...base,file:'body_preview.html',revision:saved.reference_id});
+ $('preview').src='/api/media?'+new URLSearchParams({...base,file:'body_preview.html',cleaned:'1',revision:saved.reference_id});
  try{sessionStorage.removeItem(draftKey)}catch{}
  notify('saved',{output:saved.output,cached:true});$('savedPath').textContent=saved.output;$('saved').hidden=false;
  $('referenceStatus').textContent='本条已确认 · 待统一导出';
- message(saved.warning||'已确认对齐并保留，可继续下一条；最后点击顶部“导出点云成果”一次保存整批成果。');candidate=null;
+ message(saved.warning||'已确认坐标对齐，可继续下一条；最后点击顶部“导出点云成果”一次保存整批成果。');candidate=null;
 });
 $('openSaved').onclick=()=>{if(!saved)return;if(embedded){notify('view-saved');return}location.href='/'};
 action(async()=>{
