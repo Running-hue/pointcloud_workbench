@@ -34,6 +34,7 @@ pointcloud_workbench/
 | --- | --- |
 | `backend/app.py` | 本机 HTTP 服务、页面与资源路由、请求鉴权、API 转发、服务启动 |
 | `backend/workspace.py` | 数据集载入、输入核对、采集筛选、后台生成任务、批量导出 |
+| `backend/features.py` | 可见中心线、几何特征、局部法向序列、质量掩码与特征序列化 |
 | `backend/core.py` | 毫米几何、投影/反投影、输入校验、基础重建和点云文件输出 |
 | `backend/rgb.py` | RGB 分割对应的几何重建 |
 | `backend/registration.py` | RGB 与深度的配准核对、遮挡和时序检查 |

@@ -65,6 +65,7 @@ git diff --check
 | 载入、输入核对、任务、筛选、导出 | `test_workspace.py`、`test_input_validation.py` |
 | 坐标参考与对齐 | `test_alignment.py`、`body_view_runtime.cjs` |
 | 清理、撤销、切片和复核 | `test_processing.py` |
+| 几何特征、弯体法向、缺失掩码、特征缓存与导出 | `test_features.py` |
 | 主工作台事件和状态 | `test_workbench.cjs` |
 | 离线相机点云预览 | `test_viewer.py`、`viewer_runtime.cjs` |
 | 目录、入口、默认路径和资源路由 | `test_project_layout.py` |

@@ -732,12 +732,15 @@ class Workspace:
                                     'reviewed': report['reviewed'], 'points': report['stats']['points'],
                                     'has_alignment': alignment_status(within(stage, row['storage_relative_dir'])),
                                     'has_cleaning': (within(stage, row['storage_relative_dir'])/'pointcloud_cleaning.json').is_file(),
+                                    'has_features': (within(stage, row['storage_relative_dir'])/'geometry_features.json').is_file(),
                                     'cloud_decision': row.get('cloud_decision', 'pending') if mode == 'export' else 'pending'} for row, report in completed]}
             manifest['aligned_only'] = self.job['aligned_only']
             manifest['group_by_decision'] = self.job['group_by_decision']
             manifest['decisions'] = self.job['decisions']
             write_json(stage/'pointcloud_dataset.json', manifest)
             if mode == 'export':
+                from .features import aggregate
+                aggregate(stage, completed)
                 exported = {row['relative_dir']: row['storage_relative_dir'] for row, _ in completed}
                 completed_rows = {row['relative_dir']: row for row, _ in completed}
                 screening = []
@@ -770,7 +773,8 @@ class Workspace:
             final_job = {**copy.deepcopy(self.job), 'status': status, 'current': '已按原相对目录保存全部成果'}
             write_json(stage/'export.json', final_job)
             links = ''.join(f'<li><a href="{quote(row["storage_relative_dir"], safe="/")}/{"processing_preview.html" if row.get("has_cleaning") else "body_preview.html" if row["has_alignment"] else "preview.html"}">{escape(row["storage_relative_dir"])}</a> · 主点云 <a href="{quote(row["storage_relative_dir"], safe="/")}/{row["primary_ply"]}">{row["primary_ply"]}</a> · 当前 {row["current_points"]:,} 点 · {"测量已复核" if row["measurement_ready"] else "测量待复核"}</li>' for row in manifest['frames'])
-            (stage/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>点云成果</title><style>body{font:16px system-ui;margin:40px;line-height:2}a{color:#167b6b}</style><h1>毫米点云成果</h1><p>每次采集的 PLY、NPZ、检查图和生成记录均保存在对应文件夹。</p><ul>'+links+'</ul>', encoding='utf-8')
+            feature_link = '<p><a href="geometry_features.csv">批量几何特征 CSV</a>；已对齐采集目录另含 geometry_features.json、profile_sequence.csv / npz（缺失值与复核掩码分别保存）。</p>' if mode == 'export' else ''
+            (stage/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>点云成果</title><style>body{font:16px system-ui;margin:40px;line-height:2}a{color:#167b6b}</style><h1>毫米点云成果</h1><p>每次采集的 PLY、NPZ、检查图和生成记录均保存在对应文件夹。</p>'+feature_link+'<ul>'+links+'</ul>', encoding='utf-8')
             if target.exists() or target.is_symlink(): raise ValueError('目标文件夹已被创建，请换名重试')
             stage.rename(target)
             stage = None

@@ -11,6 +11,7 @@ frontend/pages + frontend/assets
           ├── core / rgb / registration：毫米点云重建与输入核对
           ├── alignment：地面与猪体坐标参考
           ├── processing：原始点索引编辑、切片与测量复核
+          ├── features：可见几何、中心线法向剖面与掩码
           └── viewer + frontend/templates：离线预览
 ```
 
@@ -58,7 +59,11 @@ frontend/pages + frontend/assets
 | 每次采集的 `pointcloud_cleaning.json`、`point_edits.npz` | 清理索引、历史和复核记录 |
 | 每次采集的 `alignment.json` | 坐标参考及变换矩阵 |
 | 每次采集的 `measurement_summary.json`、`slice_measurements.csv` | 测量汇总、逐片候选与确认值 |
+| 每次采集的 `geometry_features.json`、`profile_sequence.csv/npz` | 当前保留完整点集的几何候选、局部法向序列、单位与缺失/复核掩码 |
+| 根目录的 `geometry_features.csv` | 批量几何表、相机/模态、输入版本、条件与质量统计；真实体重留空待关联 |
 | 根目录的 `pointcloud_dataset.json` | 导出采集及各条 `primary_ply`、`primary_npz`、坐标等信息 |
 | 根目录的 `cloud_screening.json`、`cloud_screening.csv` | 筛选范围、分类、导出结果及测量复核状态 |
 
 具体几何定义、数据数组及操作步骤见 [使用手册](user-guide.md)。
+
+新剖面通过 `/api/processing/features` 计算及保存参数与独立复核，身份、版本和保存回滚遵循原处理服务。参数与条件存于 `measurement.feature_settings`、`feature_quality`，标记存于 `feature_reviews`，不复用 `slice_reviews`；旧 `measurement_ready` 语义保留。仅计算不写文件，显式保存才写处理缓存；导出用同模块重新计算，原始点索引和主点云选择规则不变。详细公式和掩码见 [特征说明](features.md)。

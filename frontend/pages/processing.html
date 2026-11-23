@@ -29,7 +29,28 @@
       <div class="history"><button id="undo" disabled>撤销</button><button id="redo" disabled>重做</button><button id="restoreAll" disabled>恢复全部</button></div>
       <p class="muted">确认修改后自动暂存；原始点云保留。顶部“导出点云成果”保存清理结果和操作历史。</p>
     </div></details>
-    <details id="measurementSection"><summary>对齐后的切片复核</summary><div class="sectionbody">
+    <details id="geometrySection"><summary>几何特征与剖面序列</summary><div class="sectionbody">
+      <p id="geometryLock" class="notice">完成坐标对齐后即可计算。</p>
+      <div id="geometryControls" hidden>
+        <p class="muted">使用当前保留的完整点云。平滑可见中心线，沿局部法向切片；适用于 X 方向单调的站立姿态，明显折弯请标记不可测。</p>
+        <div class="twocol"><label>剖面数量 K<select id="profileCount"><option>16</option><option selected>32</option><option>64</option></select></label><label>薄带厚度 / mm<input id="profileThickness" type="number" min="5" max="100" value="20"></label></div>
+        <div class="twocol"><label>最少点数<input id="profileMinimum" type="number" min="3" max="500" value="20"></label><label>面积网格 / mm<input id="profileGrid" type="number" min="2" max="50" value="10"></label></div>
+        <label>尾根与颈躯连接点<select id="endpointQuality"><option value="unknown">完整性待复核</option><option value="complete">两端可见且标注已复核</option><option value="truncated">有截断或端点不明</option></select></label>
+        <label>地面高度参考<select id="groundQuality"><option value="unknown">高度可靠性待复核（仅相对高度）</option><option value="reliable">已复核地面，高度可用</option></select></label>
+        <button id="computeGeometry" class="primary">计算并保存参数</button>
+        <p id="geometryWarnings" class="notice"></p>
+        <div id="geometrySummary"></div>
+        <label>序列曲线<select id="trendChannel"><option value="width_q02_q98_mm">可见宽度 / mm</option><option value="relative_height_p95_mm">相对高度 / mm</option><option value="height_p95_mm">距地面高度 / mm</option><option value="transverse_curvature_per_mm">横剖面拟合曲率 / mm⁻¹</option></select></label>
+        <canvas id="profileTrend" class="profileplot" aria-label="沿中心线的剖面特征序列，点击选择剖面"></canvas>
+        <div class="slicenav"><button id="prevProfile" aria-label="上一局部剖面">‹</button><input id="profileSlider" type="range" min="0" max="31" value="0" aria-label="局部剖面位置"><button id="nextProfile" aria-label="下一局部剖面">›</button></div>
+        <p id="profileInfo"></p><canvas id="profilePlot" class="profileplot" aria-label="局部法向剖面预览"></canvas>
+        <div class="reviewbuttons"><button id="profileUsable">边界完整·可测</button><button id="profileUnusable">缺失·不可测</button><button id="profilePending">待定</button></div>
+        <p class="muted">此处剖面独立复核。点数充足不表示边界完整；改参数、清理或坐标变化后需重新确认。空白处不插补。</p>
+        <div class="history"><button id="downloadGeometry">几何 JSON</button><button id="downloadProfiles">序列 CSV</button><button id="downloadProfileNpz">序列 NPZ</button></div>
+        <p class="muted">顶部导出会自动计算所有已对齐采集，并生成批量几何表。积分是可见高度代理；此处不输出真实体积、胸围或预测体重。</p>
+      </div>
+    </div></details>
+    <details id="measurementSection"><summary>直线切片复核（原功能）</summary><div class="sectionbody">
       <p id="measurementLock" class="notice">请先在顶部“坐标对齐”中确认地面、尾根和颈根，再进行测量复核。</p>
       <div id="measurementControls" hidden>
         <div class="twocol"><label>切片厚度 / mm<input id="thickness" type="number" min="5" max="100" value="15"></label><label>最少点数<input id="minPoints" type="number" min="3" max="500" value="20"></label></div>
