@@ -25,7 +25,7 @@ def main():
             parser.error('前端检查需要 Node.js；也可用 --backend-only 只运行 Python 测试')
         commands.extend([node, '--check', str(script)] for script in sorted(
             (PROJECT_ROOT/'frontend'/'assets'/'js').glob('*.js')))
-        commands.append([node, '--test', str(PROJECT_ROOT/'tests'/'test_workbench.cjs')])
+        commands.append([node, '--test', *map(str, sorted((PROJECT_ROOT/'tests').glob('test_*.cjs')))])
     for command in commands:
         print('运行：'+' '.join(command), flush=True)
         result = subprocess.run(command, cwd=PROJECT_ROOT.parent, check=False)

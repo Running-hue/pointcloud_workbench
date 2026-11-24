@@ -14,7 +14,7 @@ const dataset = {dataset_id:'one', source:'/raw', segmentation:'/masks', export_
   results:'', pigs:2, reviewed:1, clouds:0, job:null};
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-async function setup(initial = dataset) {
+async function setup(initial = dataset, {storage = new Map()} = {}) {
   const elements = new Map();
   function element() {
     return {value:'', checked:false, disabled:false, hidden:false, textContent:'', children:[],
@@ -28,10 +28,12 @@ async function setup(initial = dataset) {
     elements.set(match[1], element());
   }
   elements.get('filter').value='all';
-  for (const id of ['exportKeep','exportPending','exportReject']) elements.get(id).checked=true;
+  for (const id of ['exportKeep','exportPending','exportReject','exportCleaning','exportAlignment','exportMeasurement']) elements.get(id).checked=true;
   const requests=[];
   const listeners = {}, handlers = {};
   const sandbox = {APP_TOKEN:'test', URLSearchParams, Set, requestAnimationFrame:fn=>fn(), location:{origin:'http://localhost'},
+    localStorage:{getItem(key) {if (!storage) throw new Error('storage unavailable'); return storage.get(key) ?? null;},
+      setItem(key, value) {if (!storage) throw new Error('storage unavailable'); storage.set(key,String(value));}},
     setTimeout:()=>1, clearTimeout() {}, window:{addEventListener(name, fn) {
       (handlers[name] ||= []).push(fn);
       listeners[name] = async event => { for (const handler of handlers[name]) await handler(event); };
@@ -53,7 +55,7 @@ async function setup(initial = dataset) {
     data:{type:'pointcloud-processing',dataset_id:'one',id:vm.runInContext('current',context),...data}});
   // A real processing iframe sends this after its initial context has loaded.
   await notifyProcessing({action:'busy',busy:false});
-  return {elements, requests, sandbox, listeners, notify, notifyProcessing, run:code=>vm.runInContext(code,context)};
+  return {elements, requests, sandbox, listeners, storage, notify, notifyProcessing, run:code=>vm.runInContext(code,context)};
 }
 
 test('reload with no selection offers reviewed captures and never includes drafts by default', async () => {
@@ -128,13 +130,13 @@ test('late job polling cannot restore an old failure after directory reload', as
   assert.equal(ui.elements.get('generate').disabled,false);
 });
 
-test('export plan lists only the segmentation modality for IR and RGB captures', async () => {
+test('primary files follow the segmentation modality for IR and RGB captures', async () => {
   for (const [mode, ply, other] of [['infrared','cloud_ir_mm.ply','cloud_rgb_mm.ply'],['rgb','cloud_rgb_mm.ply','cloud_ir_mm.ply']]) {
     const ui=await setup({...dataset,clouds:1,results:'/clouds',frames:[frame('1',{
       has_cloud:true,points:100,cloud_input_mode:mode,cloud_ply:ply,has_ir_file:true})]});
     ui.run('exportPlan()');
-    assert.ok(ui.elements.get('exportTree').textContent.includes(ply));
-    assert.ok(!ui.elements.get('exportTree').textContent.includes(other));
+    assert.equal(ui.run('currentFiles(state.frames[0]).ply'),ply);
+    assert.notEqual(ui.run('currentFiles(state.frames[0]).ply'),other);
   }
 });
 
@@ -269,8 +271,11 @@ test('failed and manually skipped captures stay visible and never enter automati
   assert.deepEqual(clone(ui.run('generationPlan().ids')),['1']);
   assert.match(ui.elements.get('generationHint').textContent,/核对失败 1 次.*手动标记 1 次/);
   assert.match(ui.elements.get('showValidation').textContent,/核对失败 1/);
-  ui.elements.get('filter').value='failed';
-  assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['2']);
+  ui.elements.get('showValidation').onclick();
+  assert.equal(ui.elements.get('validationDialog').open,true);
+  const issues=ui.elements.get('validationIssues').children;
+  assert.deepEqual(issues.map(item=>item.children[0].children[0].textContent),['pig_2/capture','pig_3/capture']);
+  assert.match(issues[0].children[0].children[1].textContent,/分割清单与逐帧输入模式不一致/);
   ui.elements.get('filter').value='excluded';
   assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['3']);
   ui.run("selected = new Set(['1','2','3']); controls();");
@@ -343,14 +348,14 @@ test('cloud quality selection is authenticated and separate from segmentation re
   await ui.elements.get('cloudReject').onclick();
   assert.equal(ui.elements.get('cloudReject')['aria-pressed'],'true');
   assert.equal(ui.elements.get('cloudPending')['aria-pressed'],'false');
-  assert.deepEqual(ui.requests.find(r=>r.url==='/api/review_cloud').payload,{dataset_id:'one',id:'1',decision:'reject'});
+  assert.deepEqual(ui.requests.find(r=>r.url==='/api/review_cloud').payload,{dataset_id:'one',id:'1',decision:'reject',stage:'cleaning'});
   assert.equal(ui.run('state.frames[0].reviewed'),false);
   assert.equal(ui.run('state.frames[0].cloud_decision'),'reject');
-  ui.elements.get('filter').value='reject';ui.elements.get('filter').listeners.input();
+  ui.elements.get('filter').value='all';ui.elements.get('filter').listeners.input();
   assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['1']);
 });
 
-test('aligned export includes all three selected review states in separate folders', async () => {
+test('export includes aligned and unaligned captures without the removed condition selector', async () => {
   const frames=[frame('1',{has_cloud:true,points:100,has_alignment:true,cloud_decision:'keep'}),
     frame('2',{has_cloud:true,points:100,has_alignment:true,cloud_decision:'pending'}),
     frame('3',{has_cloud:true,points:100,has_alignment:true,cloud_decision:'reject'}),
@@ -358,17 +363,15 @@ test('aligned export includes all three selected review states in separate folde
   const ui=await setup({...dataset,frames,clouds:4,results:'/clouds'});
   ui.elements.get('export').onclick();
   assert.equal(ui.elements.has('exportAligned'),false);
-  assert.equal(ui.elements.get('exportContent').value,'all');
-  ui.elements.get('exportContent').value='aligned';ui.elements.get('exportContent').onchange();
+  assert.equal(ui.elements.has('exportContent'),false);
   assert.equal(ui.elements.get('exportDialog').open,true);
-  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','2','3']);
-  for (const label of ['保留/','待定/','淘汰/']) assert.ok(ui.elements.get('exportTree').textContent.includes(label));
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','2','3','4']);
   ui.elements.get('exportPending').checked=false;ui.elements.get('exportPending').onchange();
-  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','3']);
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','3','4']);
   ui.elements.get('exportParent').value='/chosen';ui.elements.get('exportName').value='aligned-output';
   await ui.elements.get('confirmExport').onclick();
   assert.deepEqual(ui.requests.find(r=>r.url==='/api/export').payload,
-    {dataset_id:'one',ids:['1','3'],scope_ids:['1','2','3','4'],parent:'/chosen',name:'aligned-output',aligned_only:true,decisions:['keep','reject'],group_by_decision:true});
+    {dataset_id:'one',ids:['1','3','4'],scope_ids:['1','2','3','4'],parent:'/chosen',name:'aligned-output',export_layout:'split',stages:['cleaning','alignment','review'],decisions:['keep','reject'],group_by_decision:true});
 });
 
 test('full export also groups pending and rejected clouds and enforces review checkboxes', async () => {
@@ -377,43 +380,38 @@ test('full export also groups pending and rejected clouds and enforces review ch
     frame('3',{has_cloud:true,cloud_decision:'reject'}),frame('4',{has_cloud:true,cloud_decision:'pending'})];
   const ui=await setup({...dataset,frames,clouds:4,results:'/clouds'});
   ui.elements.get('export').onclick();
-  ui.elements.get('exportContent').value='all';ui.elements.get('exportContent').onchange();
   assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','2','3','4']);
   await ui.elements.get('confirmExport').onclick();
   const payload=ui.requests.find(r=>r.url==='/api/export').payload;
-  assert.equal(payload.aligned_only,false);assert.equal(payload.group_by_decision,true);
+  assert.equal('aligned_only' in payload,false);assert.equal(payload.group_by_decision,true);
   assert.deepEqual(payload.decisions,['keep','pending','reject']);
-  ui.elements.get('exportContent').value='aligned';ui.elements.get('exportPending').checked=false;
-  ui.elements.get('exportContent').onchange();
-  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1']);
+  ui.elements.get('exportPending').checked=false;ui.elements.get('exportPending').onchange();
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1','3']);
   for (const id of ['exportKeep','exportPending','exportReject']) ui.elements.get(id).checked=false;
   ui.elements.get('exportKeep').onchange();
   assert.equal(ui.elements.get('confirmExport').disabled,true);
   assert.match(ui.elements.get('exportEligibility').textContent,/至少勾选/);
 });
 
-test('capture screening context and exported primary files agree across all three steps', async () => {
+test('capture screening context and export eligibility agree across all three steps', async () => {
   const row=frame('1',{has_cloud:true,points:100,has_alignment:true,has_cleaning:true,removed_points:10,
-    cloud_decision:'pending',cloud_review_stale:true,measurement_slice_count:12,measurement_usable_slices:3});
+    cloud_decision:'pending',cloud_review_stale:true,measurement_slice_count:32,measurement_usable_slices:3});
   const ui=await setup({...dataset,frames:[row],clouds:1,results:'/clouds'});
+  ui.elements.get('exportLayout').value='merged';
   ui.run("selected.add('1')");
   for (const view of ['cleaning','alignment','review']) {
     ui.run(`setWorkspaceView('${view}'); alignmentBusy=false; processingBusy=false; controls();`);
-    assert.match(ui.elements.get('cloudReviewHint').textContent,/本次采集.*处理后点集.*猪体坐标/);
-    assert.match(ui.elements.get('cloudReviewHint').textContent,/3\/12 片/);
+    assert.match(ui.elements.get('cloudReviewHint').textContent,/本次采集.*阶段/);
+    assert.match(ui.elements.get('cloudReviewHint').textContent,/3\/32 片/);
     assert.match(ui.elements.get('cloudReviewHint').textContent,/重新确认/);
     assert.equal(ui.elements.get('cloudPending')['aria-pressed'],'true');
     ui.elements.get('export').onclick();
-    assert.equal(ui.elements.get('exportContent').value,'all');
-    assert.match(ui.elements.get('exportTree').textContent,/主点云：cloud_cleaned_body_mm.ply · cleaned_body_points.npz/);
-    assert.match(ui.elements.get('exportTree').textContent,/current_pointcloud.json/);
+    assert.equal(ui.elements.has('exportContent'),false);
     assert.match(ui.elements.get('exportEligibility').textContent,/测量已复核 0 次/);
     ui.elements.get('exportDialog').close();
   }
   ui.run("state.frames[0].has_alignment=false; renderViewer(); alignmentBusy=false; processingBusy=false;");
   ui.elements.get('export').onclick();
-  assert.match(ui.elements.get('exportTree').textContent,/主点云：cloud_cleaned_mm.ply · cleaned_points.npz/);
-  assert.match(ui.elements.get('exportTree').textContent,/相机坐标/);
 });
 
 test('export jobs lock the current editor without reloading its context against a busy workspace', async () => {
@@ -511,12 +509,15 @@ test('alignment confirmation auto advances after the editor unlocks in either me
 });
 
 test('without auto advance the saved capture stays visible even when its filter no longer matches', async () => {
-  const frames=[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})];
+  const keep={decision:'keep',available:true,has_output:true,reviewed:true,blocked_by:''};
+  const frames=['1','2'].map(id=>frame(id,{has_cloud:true,has_alignment:true,points:100,
+    workflow_stages:stageStatuses({alignment:{...keep}})}));
   const ui=await setup({...dataset,frames,clouds:2,results:'/clouds'});
-  ui.elements.get('filter').value='pending';ui.elements.get('filter').listeners.input();
+  ui.elements.get('filter').value='alignment';ui.elements.get('filter').listeners.input();
   ui.elements.get('alignCurrent').onclick();await ui.notify({action:'busy',busy:false});
-  ui.sandbox.reply=async()=>({...dataset,frames:[{...frames[0],cloud_decision:'reject'},frames[1]],clouds:2,results:'/clouds'});
+  ui.sandbox.reply=async()=>({...dataset,frames:[{...frames[0],workflow_stages:stageStatuses({alignment:{...keep,decision:'reject'}})},frames[1]],clouds:2,results:'/clouds'});
   await ui.elements.get('cloudReject').onclick();
+  assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['2']);
   assert.equal(ui.run('current'),'1');
   assert.equal(ui.elements.get('cloudReject')['aria-pressed'],'true');
   assert.equal(ui.elements.get('alignmentEditor').hidden,false);
@@ -533,4 +534,262 @@ test('late confirmation response cannot move a capture the user has since select
   finish({...dataset,frames:[{...frames[0],has_alignment:true},frames[1]],clouds:2,results:'/clouds'});await save;
   assert.equal(ui.run('current'),'2');
   assert.equal(ui.run('pendingAdvance'),null);
+});
+
+
+test('capture cards show only cleaning, alignment and current profile review progress', async () => {
+  const row=frame('1',{has_cloud:true,points:100,has_alignment:true,alignment_cached:true,
+    has_cleaning:true,removed_points:10,cloud_decision:'keep',reviewed:true,
+    measurement_slice_count:32,measurement_usable_slices:3});
+  const ui=await setup({...dataset,frames:[row],clouds:1});
+  const card=ui.elements.get('frames').children[0];
+  const chips=card.children[1].children[2];
+  assert.deepEqual(chips.children.map(line=>line.textContent),[
+    '点云清理：已记录（已删 10 点）','坐标对齐：已确认','测量复核：已确认 3/32 片']);
+  row.measurement_ready=true;row.measurement_usable_slices=32;
+  ui.run(`state.frames=${JSON.stringify([row])};renderList()`);
+  assert.match(ui.elements.get('frames').children[0].children[1].children[2].children[2].textContent,/已复核 32\/32 片/);
+});
+
+test('capture stage colors follow each decision, including blocked downstream stages', async () => {
+  const row=frame('1',{has_cloud:true,has_alignment:true,workflow_stages:{
+    cleaning:{decision:'keep'},alignment:{decision:'pending'},review:{decision:'reject'}}});
+  const ui=await setup({...dataset,frames:[row],clouds:1});
+  const colors=()=>ui.elements.get('frames').children[0].children[1].children[2].children.map(line=>line.className);
+  assert.deepEqual(colors(),['stage-status stage-keep','stage-status stage-pending','stage-status stage-reject']);
+  ui.run("state.frames[0].workflow_stages.alignment={decision:'keep',blocked_by:'cleaning'};renderList()");
+  assert.equal(colors()[1],'stage-status stage-reject');
+});
+
+const stageStatuses = (extra = {}) => ({
+  cleaning:{decision:'keep',available:true,has_output:true,reviewed:true,version:{cleaning_digest:''},blocked_by:''},
+  alignment:{decision:'pending',available:true,has_output:false,reviewed:false,version:{},blocked_by:''},
+  review:{decision:'pending',available:false,has_output:false,reviewed:false,version:{},blocked_by:''}, ...extra});
+
+test('export includes only completed stages and cleaning can be selected independently', async () => {
+  const row=frame('1',{has_cloud:true,cloud_ply:'cloud_ir_mm.ply',workflow_stages:stageStatuses()});
+  const ui=await setup({...dataset,frames:[row],clouds:1,results:'/clouds'});
+  ui.elements.get('export').onclick();
+  assert.deepEqual(clone(ui.run('Object.keys(exportStageEntries(state.frames[0]))')),['cleaning']);
+  assert.match(ui.elements.get('exportEligibility').textContent,/点云清理 1 次、坐标对齐 0 次、测量复核 0 次/);
+  ui.elements.get('exportCleaning').checked=false;ui.elements.get('exportCleaning').onchange();
+  assert.equal(ui.elements.get('confirmExport').disabled,true);
+  ui.elements.get('exportAlignment').checked=false;
+  ui.elements.get('exportMeasurement').checked=false;
+  ui.run('exportPlan()');
+  assert.match(ui.elements.get('exportEligibility').textContent,/至少勾选一个导出阶段/);
+});
+
+test('measurement export explains geometry and sequences and follows the selected stage', async () => {
+  const stages=stageStatuses({alignment:{decision:'keep',available:true,has_output:true,reviewed:true,blocked_by:''},
+    review:{decision:'pending',available:true,has_output:true,reviewed:false,blocked_by:''}});
+  const row=frame('1',{has_cloud:true,has_alignment:true,workflow_stages:stages});
+  const ui=await setup({...dataset,frames:[row],clouds:1,results:'/clouds'});
+  ui.elements.get('export').onclick();
+  assert.match(ui.elements.get('exportHint').textContent,/整体几何特征.*批量 CSV.*剖面序列/);
+  assert.match(ui.elements.get('exportEligibility').textContent,/测量复核 1 次/);
+  ui.elements.get('exportMeasurement').checked=false;ui.elements.get('exportMeasurement').onchange();
+  assert.equal(ui.run('exportStageEntries(state.frames[0]).review'),undefined);
+});
+
+test('each tab displays and submits its own stage decision and version', async () => {
+  const stages=stageStatuses({alignment:{decision:'reject',available:true,has_output:true,reviewed:true,blocked_by:'',version:{alignment_reference_id:'a'}},
+    review:{decision:'pending',available:false,has_output:false,blocked_by:'alignment'}});
+  const row=frame('1',{has_cloud:true,has_alignment:true,workflow_stages:stages});
+  const ui=await setup({...dataset,frames:[row],clouds:1,results:'/clouds'});
+  assert.equal(ui.elements.get('cloudKeep')['aria-pressed'],'true');
+  ui.run("setWorkspaceView('alignment'); alignmentBusy=false; controls()");
+  assert.equal(ui.elements.get('cloudReject')['aria-pressed'],'true');
+  assert.equal(ui.elements.get('reviewCurrent').disabled,true);
+  assert.equal(ui.elements.get('stageReviewLabel').textContent,'对齐筛选');
+  ui.sandbox.reply=async()=>({...dataset,frames:[row],clouds:1,results:'/clouds'});
+  await ui.elements.get('cloudPending').onclick();
+  assert.deepEqual(ui.requests.find(r=>r.url==='/api/review_cloud').payload,
+    {dataset_id:'one',id:'1',decision:'pending',stage:'alignment',stage_version:{alignment_reference_id:'a'}});
+});
+
+test('later rejection does not remove cleaning keep from a keep-only export', async () => {
+  const stages=stageStatuses({alignment:{decision:'reject',available:true,has_output:true,reviewed:true,blocked_by:''},
+    review:{decision:'pending',available:false,has_output:true,blocked_by:'alignment'}});
+  const row=frame('1',{has_cloud:true,has_alignment:true,cloud_ply:'cloud_ir_mm.ply',workflow_stages:stages});
+  const ui=await setup({...dataset,frames:[row],clouds:1,results:'/clouds'});
+  ui.elements.get('export').onclick();
+  ui.elements.get('exportPending').checked=false;ui.elements.get('exportReject').checked=false;
+  ui.run('exportPlan()');
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),['1']);
+  assert.deepEqual(clone(ui.run('Object.keys(exportStageEntries(state.frames[0]))')),['cleaning']);
+  ui.run("state.frames[0].workflow_stages.cleaning.decision='reject'; state.frames[0].workflow_stages.alignment.blocked_by='cleaning'; renderViewer(); controls()");
+  assert.equal(ui.elements.get('alignCurrent').disabled,true);
+  assert.equal(ui.elements.get('reviewCurrent').disabled,true);
+});
+
+test('export defaults to stage folders and can switch to merged folders with the same selection',async()=>{
+  const stages=stageStatuses({cleaning:{decision:'keep',has_output:true,reviewed:true,blocked_by:''},
+    alignment:{decision:'keep',has_output:true,reviewed:true,blocked_by:''},
+    review:{decision:'pending',has_output:true,reviewed:true,blocked_by:''}});
+  const ui=await setup({...dataset,frames:[frame('1',{has_cloud:true,has_alignment:true,workflow_stages:stages})],clouds:1,results:'/clouds'});
+  ui.elements.get('export').onclick();
+  assert.equal(ui.elements.get('exportLayout').value,'split');
+  assert.match(ui.elements.get('exportLayoutHint').textContent,/该阶段.*不重复复制/);
+  const ids=clone(ui.run('exportRows().map(r=>r.id)'));
+  ui.elements.get('exportLayout').value='merged';ui.elements.get('exportLayout').onchange();
+  assert.deepEqual(clone(ui.run('exportRows().map(r=>r.id)')),ids);
+  assert.match(ui.elements.get('exportLayoutHint').textContent,/最后导出阶段/);
+  await ui.elements.get('confirmExport').onclick();
+  const payload=ui.requests.find(r=>r.url==='/api/export').payload;
+  assert.equal(payload.export_layout,'merged');
+  assert.deepEqual(payload.stages,['cleaning','alignment','review']);
+});
+
+test('five cumulative progress filters include later completions and stay independent of the editor', async () => {
+  const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
+  const frames=[
+    frame('clean',{has_cloud:true,workflow_stages:stageStatuses()}),
+    frame('align',{has_cloud:true,has_alignment:true,workflow_stages:stageStatuses({alignment:{...keep}})}),
+    frame('done',{has_cloud:true,has_alignment:true,workflow_stages:stageStatuses({alignment:{...keep},review:{...keep}})}),
+    frame('align-only',{has_cloud:true,has_alignment:true,workflow_stages:stageStatuses({cleaning:{...keep,decision:'pending'},alignment:{...keep}})}),
+    frame('skipped',{excluded:true}),
+  ];
+  const ui=await setup({...dataset,frames,clouds:4});
+  const shown=()=>clone(ui.run('visibleRows().map(row=>row.id)'));
+  const apply=value=>{ui.elements.get('filter').value=value;ui.elements.get('filter').listeners.input();};
+  apply('cleaning');assert.deepEqual(shown(),['clean','align','done']);
+  apply('alignment');assert.deepEqual(shown(),['align','done']);
+  apply('completed');assert.deepEqual(shown(),['done']);
+  assert.equal(ui.run('current'),'done');
+  for (const view of ['cleaning','alignment','review']) {
+    ui.run(`setWorkspaceView('${view}')`);
+    assert.deepEqual(shown(),['done']);
+  }
+  apply('excluded');assert.deepEqual(shown(),['skipped']);
+  apply('all');assert.deepEqual(shown(),frames.map(row=>row.id));
+  const html=fs.readFileSync(path.join(app,'frontend','pages','index.html'),'utf8');
+  const filter=html.match(/<select id="filter"[^>]*>([\s\S]*?)<\/select>/)[1];
+  assert.deepEqual([...filter.matchAll(/<option value="([^"]+)"/g)].map(match=>match[1]),
+    ['all','cleaning','alignment','completed','excluded']);
+  for (const id of ['cleaningFilter','alignmentFilter','reviewFilter']) assert.equal(ui.elements.has(id),false);
+});
+
+test('completion progress counts current explicit keeps and remains global under filtering', async () => {
+  const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
+  const done=id=>frame(id,{has_cloud:true,has_alignment:true,has_cleaning:false,measurement_ready:false,
+    workflow_stages:{cleaning:{...keep},alignment:{...keep},review:{...keep}}});
+  const frames=['done','stale','blocked','pending','rejected','unreviewed','no-output','no-cloud'].map(done);
+  frames[1].workflow_stages.cleaning.stale=true;
+  frames[2].workflow_stages.review.blocked_by='alignment';
+  frames[3].workflow_stages.alignment.decision='pending';
+  frames[4].workflow_stages.review.decision='reject';
+  frames[5].workflow_stages.review.reviewed=false;
+  frames[6].workflow_stages.alignment.has_output=false;
+  frames[7].has_cloud=false;
+  frames.push(frame('legacy',{has_cloud:true,has_alignment:true,cloud_decision:'keep'}));
+  const initial={...dataset,frames,clouds:8};
+  const ui=await setup(initial);
+  assert.equal(ui.elements.get('collectionProgressText').textContent,'三阶段完成 1 / 9');
+  assert.equal(ui.elements.get('collectionProgress').value,1);
+  assert.equal(ui.elements.get('collectionProgress').max,9);
+  assert.equal(ui.elements.get('collectionPercent').textContent,'11%');
+  assert.equal(ui.elements.get('stageProgressText').textContent,'清理 6 · 对齐 5 · 复核 4');
+  assert.match(ui.elements.get('datasetSummary').textContent,/已采集完毕 1 次/);
+  const badge=ui.elements.get('frames').children[0].children[1].children[0].children[0];
+  assert.equal(badge.textContent,'已采集完毕');
+  ui.elements.get('filter').value='completed';ui.elements.get('filter').listeners.input();
+  assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['done']);
+  assert.match(ui.elements.get('listFooter').textContent,/显示 1\/9 · 已完成 1/);
+  assert.equal(ui.elements.get('collectionProgressText').textContent,'三阶段完成 1 / 9');
+  ui.elements.get('filter').value='cleaning';ui.elements.get('filter').listeners.input();
+  assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['done','blocked','pending','rejected','unreviewed','no-output']);
+  ui.elements.get('filter').value='alignment';ui.elements.get('filter').listeners.input();
+  assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['done','blocked','rejected','unreviewed']);
+  ui.elements.get('filter').value='all';
+  ui.elements.get('search').value='stale';ui.elements.get('search').listeners.input();
+  assert.equal(ui.run('visibleRows().length'),1);
+  assert.match(ui.elements.get('listFooter').textContent,/已完成 0/);
+  // An upstream edit invalidates completion immediately on the next state refresh.
+  frames[0].workflow_stages.cleaning.stale=true;
+  ui.run(`accept(${JSON.stringify(initial)})`);
+  assert.equal(ui.elements.get('collectionProgress').value,0);
+  assert.match(ui.elements.get('datasetSummary').textContent,/已采集完毕 0 次/);
+});
+
+test('empty datasets show a zero completion progress without an invalid ratio', async () => {
+  const ui=await setup({...dataset,frames:[],pigs:0,reviewed:0,clouds:0});
+  assert.equal(ui.elements.get('collectionProgressText').textContent,'三阶段完成 0 / 0');
+  assert.equal(ui.elements.get('collectionPercent').textContent,'0%');
+  assert.equal(ui.elements.get('collectionProgress').value,0);
+  assert.equal(ui.elements.get('collectionProgress').max,1);
+});
+
+test('collapsing filters preserves scope and selections, exposes hidden conditions and remembers its state', async () => {
+  const storage=new Map([['pointcloud-filters-collapsed','1']]);
+  const frames=[frame('1',{camera:{type:'itof'},input_mode:'rgb'}),frame('2',{camera:{type:'stereo'},input_mode:'infrared'})];
+  const initial={...dataset,frames};
+  const ui=await setup(initial,{storage});
+  assert.equal(ui.elements.get('listFilters').hidden,true);
+  assert.equal(ui.elements.get('toggleFilters')['aria-expanded'],'false');
+  assert.equal(ui.elements.get('toggleFilters').textContent,'展开筛选');
+  ui.elements.get('cameraFilter').value='itof';ui.elements.get('cameraFilter').onchange();
+  ui.elements.get('modeFilter').value='rgb';ui.elements.get('modeFilter').onchange();
+  ui.elements.get('search').value='1';ui.elements.get('search').listeners.input();
+  ui.run("selected=new Set(['1','2']);renderList();controls()");
+  assert.equal(ui.elements.get('filterSummary').textContent,'全部采集 · iToF · RGB 分割 · 搜索“1”');
+  assert.match(ui.elements.get('filterSummary').title,/全部采集；iToF；RGB 分割；搜索“1”/);
+  assert.match(ui.elements.get('selectedCount').textContent,/已勾选 2 · 隐藏 1/);
+  const current=ui.run('current'), requestCount=ui.requests.length;
+  ui.elements.get('toggleFilters').onclick();
+  assert.equal(ui.elements.get('listFilters').hidden,false);
+  assert.equal(ui.elements.get('filterSummary').hidden,true);
+  assert.equal(ui.elements.get('toggleFilters')['aria-expanded'],'true');
+  assert.equal(storage.get('pointcloud-filters-collapsed'),'0');
+  ui.elements.get('toggleFilters').onclick();
+  assert.equal(storage.get('pointcloud-filters-collapsed'),'1');
+  assert.equal(ui.elements.get('search').value,'1');
+  assert.equal(ui.elements.get('cameraFilter').value,'itof');
+  assert.equal(ui.elements.get('modeFilter').value,'rgb');
+  assert.equal(ui.elements.get('filter').value,'all');
+  assert.equal(ui.run('current'),current);
+  assert.deepEqual(clone(ui.run('[...selected]')),['1','2']);
+  assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['1']);
+  assert.equal(ui.requests.length,requestCount);
+  const reloaded=await setup(initial,{storage});
+  assert.equal(reloaded.elements.get('listFilters').hidden,true);
+  assert.equal(reloaded.elements.get('toggleFilters').textContent,'展开筛选');
+  assert.equal(reloaded.elements.get('filterSummary').textContent,'全部采集');
+  const html=fs.readFileSync(path.join(app,'frontend','pages','index.html'),'utf8');
+  const panel=html.slice(html.indexOf('<aside class="listpanel">'),html.indexOf('</aside>'));
+  assert.ok(panel.indexOf('collectionProgressText')<panel.indexOf('id="listFilters"'));
+  assert.ok(panel.indexOf('id="selectAll"')<panel.indexOf('id="listFilters"'));
+  assert.ok(panel.indexOf('id="listFilters"')<panel.indexOf('id="frames"'));
+  assert.doesNotMatch(panel,/listfooter|stagefilters/);
+});
+
+test('filter disclosure still works when browser preference storage is unavailable', async () => {
+  const ui=await setup(dataset,{storage:null});
+  assert.equal(ui.elements.get('listFilters').hidden,false);
+  ui.elements.get('toggleFilters').onclick();
+  assert.equal(ui.elements.get('listFilters').hidden,true);
+  ui.elements.get('toggleFilters').onclick();
+  assert.equal(ui.elements.get('listFilters').hidden,false);
+});
+
+test('generation from collapsed cumulative filters honors the visible scope and input eligibility', async () => {
+  const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
+  const clean=(id,extra={})=>frame(id,{has_cloud:true,camera:{type:'itof'},input_mode:'rgb',cloud_input_mode:'rgb',
+    workflow_stages:stageStatuses({cleaning:{...keep}}),...extra});
+  const frames=[clean('ready'),clean('pending',{workflow_stages:stageStatuses({cleaning:{...keep,decision:'pending'}})}),
+    clean('draft',{reviewed:false,status:'draft'}),clean('skipped',{excluded:true}),
+    clean('failed',{validation_errors:['缺少输入图']}),clean('other',{camera:{type:'stereo'},cloud_input_mode:'infrared'})];
+  const ui=await setup({...dataset,frames,clouds:6});
+  ui.run('selected.clear()');
+  ui.elements.get('cameraFilter').value='itof';ui.elements.get('cameraFilter').onchange();
+  ui.elements.get('modeFilter').value='rgb';ui.elements.get('modeFilter').onchange();
+  ui.elements.get('filter').value='cleaning';ui.elements.get('filter').listeners.input();
+  ui.elements.get('toggleFilters').onclick();
+  assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['ready','draft','skipped','failed']);
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['ready']);
+  assert.match(ui.elements.get('filterSummary').textContent,/清理已确认 · iToF · RGB 分割/);
+  assert.match(ui.elements.get('generationHint').textContent,/共 1 次.*核对失败 1 次.*手动标记 1 次/);
+  assert.equal(ui.elements.get('generate').disabled,false);
+  await ui.elements.get('generate').onclick();
+  assert.deepEqual(ui.requests.find(request=>request.url==='/api/generate').payload.ids,['ready']);
 });

@@ -5,8 +5,10 @@ let appToken = APP_TOKEN, sessionRefresh;
 let workspaceView = 'cleaning', alignmentKey = '', alignmentBusy = false;
 let pendingAdvance = null;
 let processingKey = '', processingBusy = false;
+let filtersCollapsed = false;
 const reviewButtons = {keep:'cloudKeep', pending:'cloudPending', reject:'cloudReject'};
 try { $('autoNextAlignment').checked = localStorage.getItem('pointcloud-auto-next') === '1'; } catch {}
+try { filtersCollapsed = localStorage.getItem('pointcloud-filters-collapsed') === '1'; } catch {}
 const running = () => ['running', 'stopping'].includes(state?.job?.status);
 const dirty = () => state && ($('source').value.trim() !== state.source || $('segmentation').value.trim() !== state.segmentation);
 const checkFailed = row => !!row.validation_errors?.length || !!row.missing.length;
@@ -18,6 +20,20 @@ const cameraType = row => {
 const cameraLabel = row => ({itof:'iToF', stereo:'双目', unknown:'相机待识别'}[cameraType(row)]);
 const segmentationMode = row => row.has_cloud ? row.cloud_input_mode || row.input_mode : row.input_mode;
 const cloudDecision = row => row.cloud_decision || 'pending';
+const stageLabels = {cleaning:'点云清理', alignment:'坐标对齐', review:'测量复核'};
+const stageShortLabels = {cleaning:'清理', alignment:'对齐', review:'复核'};
+const stageOptions = {cleaning:'exportCleaning', alignment:'exportAlignment', review:'exportMeasurement'};
+const filterLabels = {all:'全部采集', cleaning:'清理已确认', alignment:'清理与对齐已确认', completed:'三阶段已完成', excluded:'已跳过'};
+const stageState = (row, stage = workspaceView) => row.workflow_stages?.[stage] || {
+  decision:cloudDecision(row), stale:!!row.cloud_review_stale, available:!!row.has_cloud,
+  has_output:stage === 'cleaning' || !!row.has_alignment, reviewed:false, blocked_by:''};
+const stageDecision = (row, stage = workspaceView) => stageState(row, stage).decision;
+const stageComplete = (row, stage) => {
+  const value = stageState(row, stage);
+  return !!row.has_cloud && !!value.has_output && value.reviewed === true && value.decision === 'keep' &&
+    !value.stale && !value.blocked_by;
+};
+const captureComplete = row => Object.keys(stageLabels).every(stage => stageComplete(row, stage));
 const message = (text = '', error = false) => {
   for (const id of ['message', 'directoryMessage']) { $(id).textContent = text; $(id).title = text; $(id).classList.toggle('error', error); }
 };
@@ -92,39 +108,50 @@ function renderFilters() {
 function visibleRows() {
   const query = $('search').value.toLowerCase().trim(), filter = $('filter').value;
   const camera = $('cameraFilter').value || 'all', mode = $('modeFilter').value || 'all';
+  const stages = {all:[], cleaning:['cleaning'], alignment:['cleaning','alignment'], completed:Object.keys(stageLabels)}[filter];
   return state.frames.filter(r => (camera === 'all' || cameraType(r) === camera) &&
     (mode === 'all' || (segmentationMode(r) || 'unknown') === mode) &&
     (!query || `${r.pig_id} ${r.capture_id} ${r.relative_dir}`.toLowerCase().includes(query)) &&
-    (filter === 'all' || filter === 'cloud' && r.has_cloud || filter === 'reviewed' && r.reviewed ||
-     filter === 'draft' && !r.reviewed && !blocked(r) || filter === 'missing' && r.missing.length ||
-     filter === 'aligned' && r.has_alignment || filter === 'unaligned' && r.has_cloud && !r.has_alignment ||
-     ['keep','pending','reject'].includes(filter) && r.has_cloud && cloudDecision(r) === filter ||
-     filter === 'failed' && checkFailed(r) || filter === 'excluded' && r.excluded));
+    (filter === 'excluded' ? !!r.excluded : !!stages && stages.every(stage => stageComplete(r, stage))));
+}
+function renderFilterDisclosure() {
+  $('listFilters').hidden = filtersCollapsed;
+  $('toggleFilters').textContent = filtersCollapsed ? '展开筛选' : '收起筛选';
+  $('toggleFilters').setAttribute('aria-expanded', String(!filtersCollapsed));
+  $('filterSummary').hidden = !filtersCollapsed;
+  const summary = [filterLabels[$('filter').value] || filterLabels.all];
+  const camera = $('cameraFilter').value, mode = $('modeFilter').value, query = $('search').value.trim();
+  if (camera && camera !== 'all') summary.push({itof:'iToF',stereo:'双目',unknown:'未识别相机'}[camera] || camera);
+  if (mode && mode !== 'all') summary.push({rgb:'RGB 分割',infrared:'IR 分割',unknown:'未识别来源'}[mode] || mode);
+  if (query) summary.push('搜索“' + query + '”');
+  $('filterSummary').textContent = summary.join(' · ');
+  $('filterSummary').title = '当前筛选：' + summary.join('；');
 }
 function renderList() {
   const rows = visibleRows();
   $('frames').replaceChildren();
   for (const row of rows) {
     const item = document.createElement('div'); item.className = 'frame' + (row.id === current ? ' active' : '');
-    item.setAttribute('data-decision', cloudDecision(row));
     const check = document.createElement('input'); check.type = 'checkbox'; check.checked = selected.has(row.id);
     check.setAttribute('aria-label', '勾选 ' + row.relative_dir); check.disabled = running() || busy;
     check.onchange = () => { check.checked ? selected.add(row.id) : selected.delete(row.id); renderList(); controls(); };
     const button = document.createElement('button'); button.type = 'button';
     const title = document.createElement('strong'); title.textContent = '耳标 ' + row.pig_id;
+    if (captureComplete(row)) {
+      const complete = document.createElement('span'); complete.className = 'completionbadge';
+      complete.textContent = '已采集完毕'; complete.title = '三个阶段的当前版本均已确认保留'; title.append(complete);
+    }
     const capture = document.createElement('span'); capture.className = 'capture'; capture.textContent = row.capture_id;
     const chips = document.createElement('span'); chips.className = 'chips';
-    const mode = segmentationMode(row);
-    chips.textContent = [cameraLabel(row), mode === 'rgb' ? 'RGB 分割' : mode === 'infrared' ? 'IR 分割' : '',
-      row.has_cloud ? `${row.points.toLocaleString()} 点` : '未生成',
-      row.has_alignment ? (row.alignment_cached ? '已确认·待导出' : '坐标已对齐') : '',
-      row.has_cleaning ? `已清理 ${row.removed_points.toLocaleString()} 点` : '',
-      row.has_cloud ? '采集' + {keep:'保留',pending:'待定',reject:'淘汰'}[cloudDecision(row)] : '',
-      row.cloud_review_stale ? '版本变化·筛选待确认' : '',
-      row.has_alignment ? measurementLabel(row) : '',
-      row.reviewed ? '分割已确认' : '分割待确认', row.decision === 'reject' ? '已淘汰' : '',
-      checkFailed(row) ? '核对失败 · 自动跳过' : '', row.excluded ? '已标记跳过' : ''].filter(Boolean).join(' · ');
-    if (blocked(row) || row.decision === 'reject' || cloudDecision(row) === 'reject') chips.classList.add('warn');
+    for (const [stage, detail] of [
+      ['cleaning', row.has_cleaning ? `已记录（已删 ${(row.removed_points || 0).toLocaleString()} 点）` : '待处理'],
+      ['alignment', row.has_alignment ? '已确认' : '待对齐'],
+      ['review', measurementLabel(row)],
+    ]) {
+      const value = stageState(row, stage), line = document.createElement('span');
+      line.className = 'stage-status stage-' + (value.blocked_by ? 'reject' : value.decision || 'pending');
+      line.textContent = stageLine(row, stage, detail); chips.append(line);
+    }
     item.title = row.relative_dir + (row.validation_errors?.length ? '\n'+row.validation_errors.join('\n') :
       row.missing.length ? '\n缺少：'+row.missing.join('、') : '');
     button.append(title, capture, chips); button.disabled = alignmentBusy;
@@ -136,7 +163,16 @@ function renderList() {
   $('selectedCount').title = hiddenSelection ? `当前筛选外还有 ${hiddenSelection} 次已勾选采集，生成／导出已勾选范围时会一并处理。` : '';
   $('selectAll').checked = rows.length > 0 && rows.every(r => selected.has(r.id));
   $('selectAll').indeterminate = rows.some(r => selected.has(r.id)) && !$('selectAll').checked;
-  $('listFooter').textContent = `显示 ${rows.length} / ${state.frames.length} 次采集 · 已生成 ${state.clouds} · 已对齐 ${state.frames.filter(r => r.has_alignment).length}`;
+  const complete = state.frames.filter(captureComplete).length, total = state.frames.length;
+  $('collectionProgressText').textContent = `三阶段完成 ${complete} / ${total}`;
+  $('collectionPercent').textContent = `${total ? Math.round(complete * 100 / total) : 0}%`;
+  $('collectionProgress').value = complete; $('collectionProgress').max = Math.max(total, 1);
+  $('stageProgressText').textContent = Object.keys(stageLabels).map(stage =>
+    stageShortLabels[stage] + ' ' + state.frames.filter(row => stageComplete(row, stage)).length).join(' · ');
+  $('stageProgressText').title = '全部采集的当前版本已确认保留数；过期、待定、淘汰及后续停止的阶段不计入。';
+  $('listFooter').textContent = `显示 ${rows.length}/${total} · 已完成 ${rows.filter(captureComplete).length}`;
+  $('listFooter').title = `当前筛选范围 ${rows.length} 次，其中三阶段已完成 ${rows.filter(captureComplete).length} 次；全部采集 ${total} 次。`;
+  renderFilterDisclosure();
 }
 function selectCapture(id) {
   if (alignmentBusy || processingBusy) return;
@@ -144,15 +180,20 @@ function selectCapture(id) {
 }
 function setWorkspaceView(view) {
   workspaceView = view;
-  renderViewer(); controls();
+  renderList(); renderViewer(); controls();
+}
+function stageLine(row, stage, detail) {
+  const value = stageState(row, stage);
+  return stageLabels[stage] + '：' + (value.blocked_by ? '已停止（' + stageLabels[value.blocked_by] + '淘汰）' :
+    (row.workflow_stages ? ({keep:'保留',pending:'待定',reject:'淘汰'}[value.decision] + ' · ') : '') + detail);
 }
 function currentVersionLabel(row) {
   return (row.has_cleaning ? '处理后点集' : '原始点集') + ' · ' + (row.has_alignment ? '猪体坐标' : '相机坐标');
 }
 function measurementLabel(row) {
-  if (!row.has_alignment) return '测量待对齐';
-  if (row.measurement_ready) return '测量已复核';
-  return row.measurement_slice_count ? `测量已确认 ${row.measurement_usable_slices || 0}/${row.measurement_slice_count} 片` : '测量待复核';
+  if (!row.has_alignment) return '待对齐';
+  if (row.measurement_ready) return `已复核 ${row.measurement_usable_slices}/${row.measurement_slice_count} 片`;
+  return row.measurement_slice_count ? `已确认 ${row.measurement_usable_slices || 0}/${row.measurement_slice_count} 片` : '待复核';
 }
 function currentFiles(row) {
   return {ply:row.current_ply || (row.has_alignment ? (row.has_cleaning ? 'cloud_cleaned_body_mm.ply' : 'cloud_body_mm.ply') :
@@ -162,6 +203,7 @@ function currentFiles(row) {
 }
 function renderViewer() {
   const row = state.frames.find(r => r.id === current);
+  if (row?.workflow_stages?.[workspaceView]?.blocked_by) workspaceView = row.workflow_stages[workspaceView].blocked_by;
   const camera = row ? cameraLabel(row) : '';
   const mode = row?.cloud_input_mode || row?.input_mode;
   $('currentTitle').textContent = row ? [camera,mode === 'rgb' ? 'RGB 分割' : mode === 'infrared' ? 'IR 分割' : '',
@@ -174,9 +216,12 @@ function renderViewer() {
   }
   const hasCloud = !!row?.has_cloud;
   $('cloudReviewHint').hidden = !hasCloud;
-  $('cloudReviewHint').classList.toggle('stale', !!row?.cloud_review_stale);
-  $('cloudReviewHint').textContent = hasCloud ? `筛选对象：本次采集的${currentVersionLabel(row)}；${measurementLabel(row)}。` +
-    (row.cloud_review_stale ? '处理版本变化或旧记录未绑定版本，筛选已回到待定，请重新确认。' : '保留表示采集继续采用；测量特征需在“测量复核”中逐片确认。') : '';
+  const stage = hasCloud ? stageState(row) : {};
+  $('stageReviewLabel').textContent = {cleaning:'清理筛选',alignment:'对齐筛选',review:'测量筛选'}[workspaceView];
+  $('cloudReviewHint').classList.toggle('stale', !!stage.stale);
+  $('cloudReviewHint').textContent = hasCloud ? `筛选对象：本次采集的“${stageLabels[workspaceView]}”阶段；测量复核：${measurementLabel(row)}。` +
+    (stage.stale ? '本阶段数据变化，筛选已回到待定，请重新确认。' : stage.decision === 'reject' ?
+      '本阶段已淘汰，后续阶段停止；前面已完成的阶段仍可导出。' : '三个阶段分别筛选、分别导出；本阶段淘汰会停止后续阶段。') : '';
   const aligning = workspaceView === 'alignment' && hasCloud;
   const processing = ['cleaning','review'].includes(workspaceView) && hasCloud;
   $('empty').hidden = hasCloud;
@@ -274,8 +319,10 @@ function controls() {
   $('export').title = '选择导出内容、采集范围与保存目录，统一保存点云和筛选记录';
   $('exportCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud;
   $('cleanCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud;
-  $('alignCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud;
-  $('reviewCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud;
+  $('alignCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud ||
+    !!state?.frames.find(r => r.id === current)?.workflow_stages?.alignment?.blocked_by;
+  $('reviewCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud ||
+    !!state?.frames.find(r => r.id === current)?.workflow_stages?.review?.blocked_by;
   $('autoNextAlignment').disabled = locked;
   for (const id of ['search','filter','cameraFilter','modeFilter']) $(id).disabled = alignmentBusy || processingBusy;
   document.querySelectorAll('.frame>button').forEach(el => { el.disabled = alignmentBusy || processingBusy; });
@@ -284,8 +331,9 @@ function controls() {
   $('reveal').disabled = busy || !state?.results;
   const active = state?.frames.find(r => r.id === current);
   for (const [decision, id] of Object.entries(reviewButtons)) {
-    $(id).disabled = locked || !active?.has_cloud;
-    $(id).setAttribute('aria-pressed', String(!!active?.has_cloud && cloudDecision(active) === decision));
+    $(id).disabled = locked || !active?.has_cloud || !stageState(active).available ||
+      decision === 'keep' && !stageState(active).has_output;
+    $(id).setAttribute('aria-pressed', String(!!active?.has_cloud && stageDecision(active) === decision));
   }
   $('toggleExcluded').disabled = locked || !active || active.input_loaded === false;
   $('toggleExcluded').textContent = active?.excluded ? '取消跳过标记' : '标记跳过';
@@ -296,7 +344,8 @@ function controls() {
   document.querySelectorAll('.frame>input').forEach(el => { el.disabled = locked; });
   if (state) {
     $('directoryValidation').hidden = !state.frames.some(r => blocked(r)) || dirty();
-    $('datasetSummary').textContent = dirty() ? '输入目录已更改\n请重新核对载入' : `${state.pigs} 头猪 · ${state.frames.length} 次采集\n分割已确认 ${state.reviewed} 次`;
+    $('datasetSummary').textContent = dirty() ? '输入目录已更改\n请重新核对载入' : `${state.pigs} 头猪 · ${state.frames.length} 次采集\n已采集完毕 ${state.frames.filter(captureComplete).length} 次`;
+    $('datasetSummary').title = `分割已确认 ${state.reviewed} 次；已采集完毕表示三个阶段的当前版本均已确认保留。`;
     $('destination').textContent = '导出位置：' + destination();
     $('destination').title = destination();
     const context = '当前成果：' + (state.results || '尚未生成点云');
@@ -308,7 +357,7 @@ function controls() {
       $(field).title = path;
     }
   }
-  for (const id of ['exportContent','exportParent','exportName','browseExportParent','exportKeep','exportPending','exportReject']) $(id).disabled = locked;
+  for (const id of ['exportLayout','exportParent','exportName','browseExportParent','exportKeep','exportPending','exportReject', ...Object.values(stageOptions)]) $(id).disabled = locked;
   if ($('exportDialog').open) exportPlan();
 }
 function destination() {
@@ -409,16 +458,19 @@ function advanceAfterSave() {
   if (!$('autoNextAlignment').checked || workspaceView !== 'alignment' ||
       state.dataset_id !== plan.dataset || current !== plan.id) return;
   const rows = visibleRows();
-  const next = plan.candidates.map(id=>rows.find(r=>r.id===id)).find(r=>r?.has_cloud && !r.has_alignment && cloudDecision(r)!=='reject');
+  const next = plan.candidates.map(id=>rows.find(r=>r.id===id)).find(r=>r?.has_cloud && !r.has_alignment &&
+    !stageState(r,'alignment').blocked_by && stageDecision(r,'alignment')!=='reject');
   if (next) { selectCapture(next.id); message('上一条已保存，已自动切换到下一条待对齐采集。'); }
   else message('本条已保存，当前筛选范围后面已没有待对齐采集。可在左侧回看，或导出点云成果。');
 }
 for (const [decision, button] of Object.entries(reviewButtons)) $(button).onclick = () => {
-  const id = current, plan = advancePlan();
+  const id = current, plan = advancePlan(), stage = workspaceView;
+  const version = state.frames.find(r=>r.id===id)?.workflow_stages?.[stage]?.version;
   return action(async () => {
-    accept(await api('review_cloud', {dataset_id:state.dataset_id, id, decision}), false, true);
+    accept(await api('review_cloud', {dataset_id:state.dataset_id, id, decision, stage, ...(version ? {stage_version:version} : {})}), false, true);
     pendingAdvance = plan;
-    message('当前采集处理版本已标记为' + {keep:'保留',pending:'待定',reject:'淘汰'}[decision] + '；测量复核进度单独记录。');
+    message(stageLabels[stage] + '已标记为' + {keep:'保留',pending:'待定',reject:'淘汰'}[decision] +
+      (decision === 'reject' ? '；本采集后续阶段停止，前序成果仍可导出。' : '；其他阶段的筛选结论分别保存。'));
   });
 };
 $('autoNextAlignment').onchange = () => {
@@ -491,6 +543,12 @@ function applyFilters() {
 }
 for (const id of ['search','filter']) $(id).addEventListener('input', applyFilters);
 for (const id of ['cameraFilter','modeFilter']) $(id).onchange = applyFilters;
+$('toggleFilters').onclick = () => {
+  filtersCollapsed = !filtersCollapsed;
+  try { localStorage.setItem('pointcloud-filters-collapsed', filtersCollapsed ? '1' : '0'); } catch {}
+  renderFilterDisclosure();
+};
+renderFilterDisclosure();
 $('showJob').onclick = () => $('jobDialog').showModal();
 $('closeJob').onclick = () => $('jobDialog').close();
 $('selectAll').onchange = () => { const checked = $('selectAll').checked; visibleRows().forEach(r => checked ? selected.add(r.id) : selected.delete(r.id)); renderList(); controls(); };
@@ -510,43 +568,33 @@ function exportScopeRows() {
   return state.frames.filter(r => r.has_cloud && (scope === 'all' || scope === 'current' && r.id === current || scope === 'selected' && selected.has(r.id)));
 }
 function exportRows() {
+  return exportScopeRows().filter(r => Object.keys(exportStageEntries(r)).length);
+}
+function exportStages() { return Object.entries(stageOptions).filter(([,id])=>$(id).checked).map(([stage])=>stage); }
+function exportStageEntries(row) {
   const decisions = exportDecisions();
-  return exportScopeRows().filter(r => decisions.includes(cloudDecision(r)) &&
-    ($('exportContent').value !== 'aligned' || r.has_alignment));
+  return Object.fromEntries(exportStages().map(stage=>[stage,stageState(row,stage)]).filter(([,value])=>
+    !value.blocked_by && (value.has_output || value.reviewed) && decisions.includes(value.decision)));
 }
 const exportReviewOptions = {keep:'exportKeep', pending:'exportPending', reject:'exportReject'};
-const reviewLabels = {keep:'保留', pending:'待定', reject:'淘汰'};
 function exportDecisions() { return Object.entries(exportReviewOptions).filter(([,id])=>$(id).checked).map(([decision])=>decision); }
-function exportDestination() {
-  const parent = $('exportParent').value.trim(), separator = parent.includes('\\') ? '\\' : '/';
-  return parent.replace(/[\\/]$/, '') + separator + $('exportName').value;
-}
 function exportPlan() {
-  const rows = exportRows(), scope = exportScopeRows(), aligned = $('exportContent').value === 'aligned';
-  $('exportHint').textContent = '每条采集均取当前完整点集：应用已有清理；已对齐则取猪体坐标，未对齐则取相机坐标。切换清理／对齐／复核页签不改变导出版本，原始文件和处理记录一并附带。' +
-    (aligned ? '本次仅导出已对齐采集，未对齐项只记入筛选清单。' : '本次包含已对齐和未对齐采集。');
-  $('exportPath').textContent = exportDestination();
-  $('exportCount').textContent = `${rows.length} 次采集 · 当前完整处理版本`;
-  $('exportEligibility').textContent = `范围内 ${scope.length} 次：保留 ${scope.filter(r=>cloudDecision(r)==='keep').length}、待定 ${scope.filter(r=>cloudDecision(r)==='pending').length}、淘汰 ${scope.filter(r=>cloudDecision(r)==='reject').length}；已对齐 ${scope.filter(r=>r.has_alignment).length}。` +
-    ` 本次导出中测量已复核 ${rows.filter(r=>r.measurement_ready).length} 次，其余保留待复核标记。` +
-    (!rows.length ? (!exportDecisions().length ? ' 请至少勾选一种导出状态。' : aligned ? ' 所选状态中没有已对齐点云，请调整范围或先完成对齐。' : ' 当前范围没有所选状态的点云。') : '');
-  $('exportTree').textContent = exportDecisions().map(decision=>{
-    const group=rows.filter(r=>cloudDecision(r)===decision);
-    return `${reviewLabels[decision]}/（${group.length} 次）\n` + group.slice(0,2).map(r=>{
-      const files = currentFiles(r);
-      return '  '+r.relative_dir+'/\n    主点云：'+files.ply+' · '+files.npz+'\n    '+currentVersionLabel(r)+' · '+measurementLabel(r)+
-        '\n    current_pointcloud.json · 原始生成文件 · 筛选记录'+
-        (r.has_alignment ? '\n    alignment.json · 对齐检查图' : '')+
-        (r.has_cleaning ? '\n    清理索引与历史 · measurement_summary.json'+(r.has_alignment ? ' · slice_measurements.csv' : '') : '');
-    }).join('\n')+
-      (group.length>2 ? `\n  …另 ${group.length-2} 次` : '');
-  }).join('\n')+'\ncloud_screening.json · cloud_screening.csv';
+  const rows = exportRows(), scope = exportScopeRows();
+  $('exportHint').textContent = '分别勾选要导出的阶段。后续未完成不影响前序成果，前序淘汰后停止后续。测量复核会一起导出整体几何特征（JSON＋批量 CSV）和剖面序列（CSV／NPZ），保留缺失值与复核标记。';
+  const split = $('exportLayout').value === 'split';
+  $('exportLayoutHint').textContent = split ? '各阶段只保存自身成果，按该阶段的保留／待定／淘汰分类；不重复复制原始文件、检查图和其他阶段的点云。精简成果用于交付与分析，需要继续编辑时选择“按采集合并存放”。' : '同一采集的所选阶段合并存放，按最后导出阶段的状态分类；包含原始生成文件与处理历史，可重新打开继续编辑。各阶段结论分别保存在清单。';
+  $('exportCount').textContent = `${rows.length} 次采集 · ${rows.reduce((n,r)=>n+Object.keys(exportStageEntries(r)).length,0)} 项阶段成果`;
+  $('exportEligibility').textContent = `范围内 ${scope.length} 次；本次导出：` + exportStages().map(stage=>
+    stageLabels[stage] + ' ' + rows.filter(r=>exportStageEntries(r)[stage]).length + ' 次').join('、') + '。' +
+    ` 测量已复核 ${rows.filter(r=>exportStageEntries(r).review && r.measurement_ready).length} 次；部分复核保留逐片状态。` +
+    (!rows.length ? (!exportStages().length ? ' 请至少勾选一个导出阶段。' : !exportDecisions().length ? ' 请至少勾选一种导出状态。' : ' 当前范围没有符合阶段与状态的成果。') : '');
   $('confirmExport').disabled = !rows.length || busy || running() || alignmentBusy || processingBusy;
 }
 function openExport(scope) {
   document.querySelector(`input[name=scope][value=${scope}]`).checked = true;
-  $('exportContent').value = 'all';
+  if (!['split','merged'].includes($('exportLayout').value)) $('exportLayout').value = 'split';
   for (const id of Object.values(exportReviewOptions)) $(id).checked = true;
+  for (const id of Object.values(stageOptions)) $(id).checked = true;
   $('exportParent').value = $('parent').value;
   $('exportName').value = '处理点云_' + new Date().toISOString().replace(/[-:TZ.]/g,'').slice(0,17);
   $('exportMessage').textContent = '';
@@ -554,9 +602,10 @@ function openExport(scope) {
 }
 $('exportCurrent').onclick = () => openExport('current');
 $('export').onclick = () => openExport([...selected].some(id => state.frames.some(r => r.id === id && r.has_cloud)) ? 'selected' : 'all');
-$('exportContent').onchange = exportPlan;
+$('exportLayout').onchange = exportPlan;
 document.querySelectorAll('input[name=scope]').forEach(input => input.onchange = exportPlan);
 for (const id of Object.values(exportReviewOptions)) $(id).onchange = exportPlan;
+for (const id of Object.values(stageOptions)) $(id).onchange = exportPlan;
 for (const id of ['exportParent','exportName']) $(id).addEventListener('input', exportPlan);
 $('browseExportParent').onclick = () => action(() => choose('exportParent','选择点云导出目录'));
 $('confirmExport').onclick = () => action(async () => {
@@ -564,9 +613,9 @@ $('confirmExport').onclick = () => action(async () => {
   try {
     accept(await api('export', {dataset_id:state.dataset_id, ids:exportRows().map(r=>r.id), scope_ids:exportScopeRows().map(r=>r.id),
       parent:$('exportParent').value.trim(), name:$('exportName').value,
-      aligned_only:$('exportContent').value === 'aligned', decisions:exportDecisions(), group_by_decision:true}));
+      export_layout:$('exportLayout').value, stages:exportStages(), decisions:exportDecisions(), group_by_decision:true}));
     $('parent').value = $('exportParent').value; $('name').value = state.suggested_name;
-    $('exportDialog').close(); message('开始导出当前处理版本及原始文件，主点云和测量复核状态将写入清单。');
+    $('exportDialog').close(); message('开始'+($('exportLayout').value==='split'?'按阶段拆分':'按采集合并')+'导出，测量结果和各阶段筛选结论将一起保存。');
   } catch(e) { $('exportMessage').textContent = e.message; throw e; }
   finally { exportPlan(); }
 });

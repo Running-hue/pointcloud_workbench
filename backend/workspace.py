@@ -18,12 +18,16 @@ from .core import (independent_paths, within, read_json, write_json, sha256, rec
                    COMMON_RESULT_FILES, export_metadata, EXPORT_POLICY, camera_identity, np)
 from .viewer import write_viewer
 from .alignment import AlignmentService, SIDE_FILES, alignment_status, render_body_view
-from .processing import ProcessingService, PROCESSING_FILES
+from .processing import ProcessingService, PROCESSING_FILES, MEASUREMENT_METHOD
+from . import features as feature_math
 from .paths import DEFAULT_OUTPUT_ROOT
+from .workflow import (STAGES, STAGE_LABELS, DECISIONS, stage_version, stage_records,
+                       workflow_state, stage_export_plan, final_decision)
 
 RESULT_FILES = {'points.npz', 'cloud_rgb_mm.ply', 'cloud_ir_mm.ply', 'pointcloud.json',
                 'preview.html', 'mask_depth_check.png', 'rgb_projection_check.png',
-                'rgb_registration_check.png', 'cloud_review.json', 'current_pointcloud.json'} | SIDE_FILES | PROCESSING_FILES
+                'rgb_registration_check.png', 'cloud_review.json', 'current_pointcloud.json',
+                'workflow_stages.json'} | SIDE_FILES | PROCESSING_FILES
 REVIEW_GROUPS = {'keep': '保留', 'pending': '待定', 'reject': '淘汰'}
 
 
@@ -32,7 +36,10 @@ def valid_cloud_review(record, folder, relative_dir, report):
             and record.get('decision') in {'keep', 'pending', 'reject'}
             and record.get('relative_dir') == relative_dir
             and record.get('input_mode') == input_mode(report)
-            and record.get('points_sha256') == sha256(folder/'points.npz'))
+            and record.get('points_sha256') == sha256(folder/'points.npz')
+            and ('stages' not in record or (isinstance(record['stages'], dict)
+                and all(k in STAGES and isinstance(v, dict) and v.get('decision') in DECISIONS
+                        and isinstance(v.get('version'), dict) for k, v in record['stages'].items()))))
 
 
 def processing_version(result):
@@ -44,6 +51,11 @@ def processing_version(result):
 
 def cloud_review_state(result):
     record = result.get('cloud_review')
+    if record and 'stages' in record:
+        stages = {k: v for k, v in workflow_state(result).items()
+                  if not v['blocked_by'] and (v['has_output'] or v['reviewed'])}
+        return {'cloud_decision': final_decision(stages),
+                'cloud_review_stale': any(v['stale'] for v in stages.values())}
     stale = bool(record and (record.get('schema_version') != 2
                             or record.get('processing_version') != processing_version(result)))
     return {'cloud_decision': record['decision'] if record and not stale else 'pending',
@@ -69,22 +81,28 @@ def measurement_state(result):
     valid = (result.get('has_alignment') and m.get('reference_id') == version['alignment_reference_id']
              and m.get('cleaning_digest') == record.get('cleaning_digest'))
     summary = m.get('review_summary', {}) if valid else {}
+    if (summary.get('measurement_method') != MEASUREMENT_METHOD
+            or summary.get('feature_version') != feature_math.VERSION):
+        summary = {}
     return {'measurement_ready': summary.get('measurement_ready') is True,
             'measurement_usable_slices': summary.get('usable_slices', 0),
-            'measurement_slice_count': summary.get('slice_count', 0)}
+            'measurement_slice_count': (summary.get('slice_count') or
+                feature_math.settings(m.get('feature_settings'))['count']) if result.get('has_alignment') else 0}
 
 
 def write_current_cloud(folder, result, decision):
     current = {**current_cloud(result), **measurement_state(result)}
     if (folder/'measurement_summary.json').is_file():
         summary = read_json(folder/'measurement_summary.json')
-        current.update(measurement_ready=summary.get('measurement_ready') is True,
-            measurement_usable_slices=summary.get('usable_slices', 0),
-            measurement_slice_count=summary.get('slice_count', 0))
+        if summary.get('measurement_method') == MEASUREMENT_METHOD:
+            current.update(measurement_ready=summary.get('measurement_ready') is True,
+                measurement_usable_slices=summary.get('usable_slices', 0),
+                measurement_slice_count=summary.get('slice_count', 0))
     if not all((folder/current[k]).is_file() for k in ('current_ply', 'current_npz')):
         raise ValueError('当前处理版本的主点云文件缺失，未导出本采集')
     write_json(folder/'current_pointcloud.json', {**current, 'schema_version': 1, 'unit': 'mm',
         'processing_version': processing_version(result), 'cloud_decision': decision,
+        'workflow_stages': workflow_state(result),
         'definition': 'current full-density version; originals included for traceability; keep is not measurement acceptance'})
     return current
 
@@ -96,7 +114,9 @@ def write_cloud_review(folder, result):
     if record:
         if not valid_cloud_review(record, folder, record['relative_dir'], result['report']):
             raise ValueError('点云在筛选后发生变化，请重新核对保留／待定／淘汰状态')
-        if cloud_review_state(result)['cloud_review_stale']:
+        if 'stages' in record:
+            record = {**record, 'decision': cloud_review_state(result)['cloud_decision']}
+        elif cloud_review_state(result)['cloud_review_stale']:
             record = {**cloud_review_record(result, record['relative_dir'], 'pending'),
                       'reviewed_at': None, 'previous_review': record,
                       'reason': '处理版本已变化或旧记录未绑定版本，需重新确认采集筛选'}
@@ -105,15 +125,66 @@ def write_cloud_review(folder, result):
         path.unlink()
 
 
-def cloud_review_record(result, relative_dir, decision):
+def cloud_review_record(result, relative_dir, decision, stage=None):
     points = result['folder']/'points.npz'
     if points.is_symlink() or not points.is_file():
         raise ValueError('当前点云文件不存在或路径不合法')
-    return {'schema_version': 2, 'decision': decision, 'relative_dir': relative_dir,
+    record = {'schema_version': 2, 'decision': decision, 'relative_dir': relative_dir,
             'input_mode': input_mode(result['report']), 'points_sha256': sha256(points),
             'processing_version': processing_version(result),
             'scope': 'current full-density point set and body reference; not measurement acceptance',
             'reviewed_at': datetime.now().astimezone().isoformat()}
+    if stage is not None:
+        records = stage_records(result)
+        records[stage] = {'decision': decision, 'version': stage_version(result, stage),
+                          'reviewed_at': record['reviewed_at']}
+        record.update(stages=records, scope='independent workflow stages; upstream rejection blocks downstream')
+        record['decision'] = cloud_review_state({**result, 'cloud_review': record})['cloud_decision']
+    return record
+
+
+def stage_export_result(dest, source, plan, relative_dir):
+    """Project a capture onto the requested stages, retaining point dependencies."""
+    aligned = bool(source.get('has_alignment') and any(k in plan for k in ('alignment', 'review')))
+    measured = 'review' in plan and plan['review']['has_output']
+    result = {**source, 'folder': dest, 'has_alignment': aligned,
+              'alignment_reference_id': source.get('alignment_reference_id', '') if aligned else ''}
+    if not aligned:
+        for name in SIDE_FILES | {'cleaned_body_points.npz', 'cloud_cleaned_body_mm.ply'}:
+            if (dest/name).exists():
+                (dest/name).unlink()
+    if not measured and result.get('processing'):
+        info = result['processing']
+        result['processing'] = {**info, 'record': {**info['record'], 'measurement': {}}}
+    review = cloud_review_record(source, relative_dir, final_decision(plan))
+    records = stage_records(source)
+    review['stages'] = {k: {**records.get(k, {}), 'decision': v['decision'], 'version': stage_version(result, k)}
+                        for k, v in plan.items()}
+    review['scope'] = 'independent workflow stages; upstream rejection blocks downstream'
+    result['cloud_review'] = review
+    return result
+
+
+def write_stage_products(dest, result, plan):
+    products = {}
+    current = current_cloud(result)
+    for stage, status in plan.items():
+        if stage == 'cleaning':
+            files = {'primary_ply': 'cloud_cleaned_mm.ply' if result.get('processing') else primary_ply(result['report']),
+                     'primary_npz': 'cleaned_points.npz' if result.get('processing') else 'points.npz'}
+        elif stage == 'alignment' and status['has_output']:
+            files = {'primary_ply': current['current_ply'], 'primary_npz': current['current_npz'],
+                     'alignment': 'alignment.json'}
+        elif stage == 'review' and status['has_output']:
+            files = {'geometry_json': 'geometry_features.json', 'sequence_csv': 'profile_sequence.csv',
+                     'sequence_npz': 'profile_sequence.npz', 'summary': 'measurement_summary.json'}
+        else:
+            files = {}
+        if any(not (dest/name).is_file() for name in files.values()):
+            raise ValueError(f'{STAGE_LABELS[stage]}成果文件不完整')
+        products[stage] = {'label': STAGE_LABELS[stage], **status, 'files': files}
+    write_json(dest/'workflow_stages.json', {'schema_version': 1, 'stages': products})
+    return products
 
 
 def atomic_json(path, data):
@@ -326,7 +397,18 @@ class Workspace:
             result = self.results.get(row['relative_dir'])
             if not result:
                 raise ValueError('请先生成或打开当前采集的点云')
-            record = cloud_review_record(result, row['relative_dir'], decision)
+            stage = payload.get('stage')
+            if stage is not None:
+                if not isinstance(stage, str) or stage not in STAGES:
+                    raise ValueError('请选择点云清理、坐标对齐或测量复核阶段')
+                status = workflow_state(result)[stage]
+                if not status['available']:
+                    raise ValueError('前序阶段已淘汰或尚未对齐，不能筛选本阶段')
+                if decision == 'keep' and not status['has_output']:
+                    raise ValueError('请先完成本阶段处理，再标记保留')
+                if 'stage_version' in payload and payload['stage_version'] != status['version']:
+                    raise ValueError('本阶段数据已变化，请刷新后重新确认')
+            record = cloud_review_record(result, row['relative_dir'], decision, stage)
             settings = copy.deepcopy(self.settings)
             settings.setdefault('cloud_reviews', {}).setdefault(str(self.results_root), {})[row['relative_dir']] = record
             atomic_json(self.state_dir/'settings.json', settings)
@@ -347,6 +429,7 @@ class Workspace:
                            cloud_input_mode=input_mode(r), cloud_ply=primary_ply(r),
                            cloud_camera=r.get('camera', {}),
                            **cloud_review_state(result), **current_cloud(result), **measurement_state(result),
+                           workflow_stages=workflow_state(result),
                            has_alignment=result.get('has_alignment', False),
                            alignment_cached=result.get('alignment_cached', False),
                            alignment_revision=result.get('alignment_revision', ''),
@@ -423,12 +506,15 @@ class Workspace:
         root = directory(value)
         results = {}
         storage_map = None
+        stage_locations = {}
         manifest_file = root/'pointcloud_dataset.json'
         if manifest_file.is_file():
             if manifest_file.is_symlink():
                 raise ValueError('点云清单不能使用符号链接')
             manifest = read_json(manifest_file)
-            if isinstance(manifest, dict) and manifest.get('group_by_decision') is True:
+            if isinstance(manifest, dict) and manifest.get('package_kind') == 'stage_products':
+                raise ValueError('这是按阶段导出的精简成果包，仅包含各阶段成果；继续编辑请选择原成果目录或“按采集合并”的完整导出目录')
+            if isinstance(manifest, dict) and (manifest.get('group_by_decision') is True or manifest.get('export_layout') == 'split'):
                 storage_map, relatives = {}, set()
                 if not isinstance(manifest.get('frames'), list):
                     raise ValueError('分类点云清单缺少采集记录')
@@ -444,6 +530,17 @@ class Workspace:
                         raise ValueError('分类点云清单中有重复采集或存储路径')
                     storage_map[storage] = rel
                     relatives.add(rel)
+                    if manifest.get('export_layout') == 'split':
+                        locations = entry.get('stage_storage_relative_dirs')
+                        if not isinstance(locations, dict) or not locations or any(k not in STAGES for k in locations):
+                            raise ValueError('分阶段清单的阶段路径无效')
+                        for key, location in locations.items():
+                            if not isinstance(location, str) or not location.startswith(STAGE_LABELS[key]+'/'):
+                                raise ValueError('分阶段清单的存储路径无效')
+                            within(root, location)
+                        if storage not in locations.values():
+                            raise ValueError('分阶段清单的主采集路径无效')
+                        stage_locations[rel] = locations
         for p in sorted(root.rglob('pointcloud.json')):
             storage = p.parent.relative_to(root).as_posix()
             if storage_map is not None and storage not in storage_map:
@@ -497,6 +594,7 @@ class Workspace:
             review_invalid = 0
             for rel, result in results.items():
                 record = self.settings.get('cloud_reviews', {}).get(str(root), {}).get(rel)
+                saved_locally = record is not None
                 try:
                     review_file = result['folder']/'cloud_review.json'
                     if record is None and review_file.is_file() and not review_file.is_symlink():
@@ -504,6 +602,25 @@ class Workspace:
                     if record is not None:
                         if not valid_cloud_review(record, result['folder'], rel, result['report']):
                             raise ValueError('筛选记录与点云不匹配')
+                        if rel in stage_locations and not saved_locally:
+                            records = {}
+                            for key in STAGES:
+                                if key not in stage_locations[rel]:
+                                    continue
+                                relative = Path(stage_locations[rel][key])
+                                folder = within(root, relative)
+                                if any((root/part).is_symlink() for part in (relative, *relative.parents) if str(part) != '.'):
+                                    raise ValueError('分阶段成果不能包含符号链接')
+                                path = folder/'cloud_review.json'
+                                if path.is_symlink():
+                                    raise ValueError('分阶段筛选记录不能使用符号链接')
+                                saved = read_json(path)
+                                if (not valid_cloud_review(saved, folder, rel, result['report'])
+                                        or saved['points_sha256'] != record['points_sha256']
+                                        or key not in saved.get('stages', {})):
+                                    raise ValueError('分阶段筛选记录与点云不匹配')
+                                records[key] = saved['stages'][key]
+                            record = {**record, 'stages': records}
                         result['cloud_review'] = record
                 except (ValueError, OSError, KeyError, TypeError):
                     review_invalid += 1
@@ -586,6 +703,18 @@ class Workspace:
                           and (allow_draft or r['reviewed'])]
                 if not usable: raise ValueError('所选采集中没有可生成项；请查看核对失败或跳过标记，确认分割或勾选“允许初稿预览”')
             elif mode == 'export':
+                export_layout = payload.get('export_layout', 'merged')
+                if export_layout not in ('merged', 'split'):
+                    raise ValueError('请选择按阶段拆分或合并存放')
+                stages = payload.get('stages')
+                if stages is None and export_layout == 'split':
+                    stages = list(STAGES)
+                if stages is None and any('stages' in (self.results.get(r['relative_dir'], {}).get('cloud_review') or {}) for r in rows):
+                    stages = list(STAGES)
+                if stages is not None and (not isinstance(stages, list) or not stages
+                        or any(not isinstance(s, str) or s not in STAGES for s in stages)
+                        or len(stages) != len(set(stages))):
+                    raise ValueError('请至少选择一个有效的导出阶段')
                 decisions = payload.get('decisions')
                 if decisions is not None and (not isinstance(decisions, list) or not decisions
                         or any(not isinstance(d, str) or d not in REVIEW_GROUPS for d in decisions)
@@ -600,6 +729,14 @@ class Workspace:
                     review = result.get('cloud_review')
                     if review and not valid_cloud_review(review, result['folder'], row['relative_dir'], result['report']):
                         raise ValueError('点云已变化，请重新打开成果目录并核对筛选状态')
+                    if stages is not None:
+                        if payload.get('aligned_only') is True and not alignment_status(result['folder']):
+                            raise ValueError('导出范围含未完成对齐或文件已变化的采集')
+                        plan = stage_export_plan(result, stages, decisions or ['keep', 'pending'])
+                        if not plan:
+                            raise ValueError('导出范围含没有所选阶段成果或状态的采集，请更新导出范围')
+                        row.update(exported_stages=plan, cloud_decision=final_decision(plan))
+                        continue
                     if decisions is not None and row['cloud_decision'] not in decisions:
                         raise ValueError('导出范围含未勾选状态的点云，请更新导出范围')
                     if decisions is None and row['cloud_decision'] == 'reject':
@@ -621,6 +758,8 @@ class Workspace:
                         'aligned_only': mode == 'export' and payload.get('aligned_only') is True,
                         'group_by_decision': mode == 'export' and payload.get('group_by_decision') is True,
                         'decisions': decisions if mode == 'export' else [],
+                        'stages': stages if mode == 'export' else None,
+                        'export_layout': export_layout if mode == 'export' else 'merged',
                         'total': len(rows), 'success': 0, 'skipped': [], 'errors': [], 'output': str(target),
                         'current': '准备生成' if mode == 'generate' else '准备按文件夹导出'}
             self.settings.update(export_parent=str(parent))
@@ -636,18 +775,107 @@ class Workspace:
                 self.job.update(status='stopping', current='正在完成当前采集，随后停止')
             return self.state()
 
+    def _export_copy(self, source, dest, row, plan):
+        """Write one portable capture copy, projected onto its requested stages."""
+        rel = row['relative_dir']
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        safe_copy_tree(source['folder'], dest)
+        if plan is not None:
+            source = stage_export_result(dest, source, plan, rel)
+            source['cloud_review']['processing_version'] = processing_version(source)
+        report = read_json(dest/'pointcloud.json')
+        normalized = export_metadata(report)
+        if not normalized.get('camera'):
+            # Optional provenance upgrade; portable exports never require raw inputs.
+            raw_record = Path(report.get('source_dir', ''))/'reconstruction.json'
+            try:
+                if report.get('source_sha256', {}).get('reconstruction.json') == sha256(raw_record):
+                    normalized['camera'] = camera_identity(read_json(raw_record))
+            except (OSError, ValueError, TypeError):
+                pass
+        other = 'cloud_ir_mm.ply' if input_mode(report) == 'rgb' else 'cloud_rgb_mm.ply'
+        if (dest/other).exists(): (dest/other).unlink()
+        if normalized != report and not source.get('has_alignment') and not source.get('processing'):
+            write_json(dest/'pointcloud.json', normalized)
+        # Folder exports use the current layout/theme even when
+        # the measured point data and metadata need no upgrade.
+        with np.load(dest/'points.npz', allow_pickle=False) as data:
+            write_viewer(dest/'preview.html', data, normalized)
+        if source.get('has_alignment'):
+            with np.load(dest/'body_points.npz', allow_pickle=False) as data:
+                (dest/'body_preview.html').write_text(render_body_view(data, read_json(dest/'alignment.json')), encoding='utf-8')
+        write_cloud_review(dest, source)
+        self.processing.export_to(dest, source,
+            include_measurement=plan is None or plan.get('review', {}).get('has_output', False))
+        if plan is not None:
+            row['exported_stages'] = write_stage_products(dest, source, plan)
+        if self.job.get('aligned_only') and plan is None and not alignment_status(dest):
+            raise ValueError('复制后的对齐成果不完整或校验不匹配，请重新核对后导出')
+        report = normalized
+        current = write_current_cloud(dest, source, row.get('cloud_decision', 'pending'))
+        return {**row, **current, 'has_alignment': alignment_status(dest),
+                'has_cleaning': (dest/'pointcloud_cleaning.json').is_file()}, report
+
+    def _export_stage_products(self, source, dest, row, plan):
+        """Create one compact delivery package, never a partial editable capture."""
+        key, status = next(iter(plan.items()))
+        inputs = {'points': source['folder']/'points.npz', 'report': source['folder']/'pointcloud.json'}
+        if key != 'cleaning' and status['has_output']:
+            inputs['alignment'] = source['folder']/'alignment.json'
+        if source.get('processing'):
+            for name in ('pointcloud_cleaning.json', 'point_edits.npz'):
+                inputs[name] = source['processing']['folder']/name
+        if any(path.is_symlink() or not path.is_file() for path in inputs.values()):
+            raise ValueError('阶段成果的来源文件缺失或路径不合法')
+        hashes = {name: sha256(path) for name, path in inputs.items()}
+        dest.mkdir(parents=True)
+        files = self.processing.export_stage_to(dest, source, key, status['has_output'])
+        if any(not (dest/name).is_file() for name in files.values()):
+            raise ValueError(f'{STAGE_LABELS[key]}成果文件不完整')
+        products = {key: {'label': STAGE_LABELS[key], **status, 'files': files}}
+        coordinates = {'cleaning': 'native_depth_camera', 'alignment': 'ground_body',
+                       'review': 'measurement'}[key] if status['has_output'] else 'none'
+        metadata = {'schema_version': 1, 'package_kind': 'stage_products', 'editable': False,
+            'stage': key, 'stage_label': STAGE_LABELS[key],
+            **{name: row[name] for name in ('relative_dir', 'pig_id', 'capture_id')},
+            'input_mode': input_mode(source['report']), 'unit': 'mm',
+            'coordinate_system': coordinates, 'source_sha256': hashes,
+            'camera': source['report'].get('camera', {}),
+            'decision': status['decision'], 'version': status['version'],
+            'has_output': status['has_output'], 'files': files}
+        write_json(dest/'stage_result.json', metadata)
+        write_json(dest/'workflow_stages.json', {'schema_version': 1, 'package_kind': 'stage_products',
+                                                'stages': products})
+        if any(sha256(path) != hashes[name] for name, path in inputs.items()):
+            raise ValueError('导出期间来源文件发生变化，请重新核对后导出')
+        current = {'current_ply': files.get('primary_ply', ''), 'current_npz': files.get('primary_npz', ''),
+            'current_coordinates': coordinates, 'current_points': current_cloud(source)['current_points'],
+            'measurement_ready': False, 'measurement_usable_slices': 0, 'measurement_slice_count': 0}
+        if key == 'review' and status['has_output']:
+            summary = read_json(dest/'measurement_summary.json')
+            current.update(measurement_ready=summary['measurement_ready'],
+                measurement_usable_slices=summary['usable_slices'], measurement_slice_count=summary['slice_count'])
+        return {**row, **current, 'exported_stages': products,
+            'has_alignment': key == 'alignment' and status['has_output'],
+            'has_cleaning': key == 'cleaning' and status['has_output']}, source['report']
+
     def _run(self, rows, snapshot, target, mode, allow_draft, review_scope):
-        stage, completed = None, []
+        stage, completed, stage_copies = None, [], []
+        split = self.job['export_layout'] == 'split'
         try:
             stage = Path(tempfile.mkdtemp(prefix='.pointcloud-export-', dir=target.parent))
-            if self.job['group_by_decision']:
-                for decision in self.job['decisions']:
-                    (stage/REVIEW_GROUPS[decision]).mkdir()
+            roots = [stage/STAGE_LABELS[key] for key in self.job['stages']] if split else [stage]
+            for root in roots:
+                root.mkdir(exist_ok=True)
+                if self.job['group_by_decision']:
+                    for decision in self.job['decisions']:
+                        (root/REVIEW_GROUPS[decision]).mkdir()
             for row in rows:
                 if self.stop_event.is_set(): break
                 rel = row['relative_dir']
                 storage = (Path(REVIEW_GROUPS[row['cloud_decision']])/rel).as_posix() if self.job['group_by_decision'] else rel
                 dest = within(stage, storage)
+                written = [dest] if not split else []
                 with self.lock: self.job['current'] = rel
                 try:
                     if mode == 'generate':
@@ -666,47 +894,39 @@ class Workspace:
                         export_frame(within(stage, rel), data, report, mask)
                         write_viewer(within(stage, rel)/'preview.html', data, report)
                     else:
-                        source = snapshot[rel]
-                        dest = within(stage, storage)
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        safe_copy_tree(source['folder'], dest)
-                        report = read_json(dest/'pointcloud.json')
-                        normalized = export_metadata(report)
-                        if not normalized.get('camera'):
-                            # Optional provenance upgrade; portable exports never require raw inputs.
-                            raw_record = Path(report.get('source_dir', ''))/'reconstruction.json'
-                            try:
-                                if report.get('source_sha256', {}).get('reconstruction.json') == sha256(raw_record):
-                                    normalized['camera'] = camera_identity(read_json(raw_record))
-                            except (OSError, ValueError, TypeError):
-                                pass
-                        other = 'cloud_ir_mm.ply' if input_mode(report) == 'rgb' else 'cloud_rgb_mm.ply'
-                        if (dest/other).exists(): (dest/other).unlink()
-                        if normalized != report and not source.get('has_alignment') and not source.get('processing'):
-                            write_json(dest/'pointcloud.json', normalized)
-                        # Folder exports use the current layout/theme even when
-                        # the measured point data and metadata need no upgrade.
-                        with np.load(dest/'points.npz', allow_pickle=False) as data:
-                            write_viewer(dest/'preview.html', data, normalized)
-                        if source.get('has_alignment'):
-                            with np.load(dest/'body_points.npz', allow_pickle=False) as data:
-                                (dest/'body_preview.html').write_text(render_body_view(data, read_json(dest/'alignment.json')), encoding='utf-8')
-                        write_cloud_review(dest, source)
-                        self.processing.export_to(dest, source)
-                        if self.job.get('aligned_only') and not alignment_status(dest):
-                            raise ValueError('复制后的对齐成果不完整或校验不匹配，请重新核对后导出')
-                        report = normalized
-                    exported_result = source if mode == 'export' else {'report': report}
-                    current = write_current_cloud(dest, exported_result,
-                        row.get('cloud_decision', 'pending') if mode == 'export' else 'pending')
-                    completed.append(({**row, **current, 'storage_relative_dir': storage}, report))
+                        copies = []
+                        plans = ({key: value} for key, value in row['exported_stages'].items()) if split else [row.get('exported_stages')]
+                        for plan in plans:
+                            key = next(iter(plan)) if split else ''
+                            decision = final_decision(plan) if split else row['cloud_decision']
+                            relative = Path(REVIEW_GROUPS[decision])/rel if self.job['group_by_decision'] else Path(rel)
+                            storage = (Path(STAGE_LABELS[key])/relative).as_posix() if split else relative.as_posix()
+                            dest = within(stage, storage)
+                            written.append(dest)
+                            export = self._export_stage_products if split else self._export_copy
+                            capture, report = export(snapshot[rel], dest,
+                                {**row, 'cloud_decision': decision, 'storage_relative_dir': storage}, plan)
+                            copies.append((capture, report))
+                        if split:
+                            stage_copies.extend(copies)
+                            all_products = {key: value for capture, _ in copies for key, value in capture['exported_stages'].items()}
+                            locations = {next(iter(capture['exported_stages'])): capture['storage_relative_dir'] for capture, _ in copies}
+                            capture = {**copies[-1][0], 'exported_stages': all_products,
+                                       'stage_storage_relative_dirs': locations}
+                        else:
+                            capture = copies[0][0]
+                    if mode == 'generate':
+                        current = write_current_cloud(dest, {'report': report}, 'pending')
+                        capture = {**row, **current, 'storage_relative_dir': storage,
+                                   'has_alignment': False, 'has_cleaning': False}
+                    completed.append((capture, report))
                     with self.lock: self.job['success'] += 1
                 except SkipCapture as exc:
                     with self.lock: self.job['skipped'].append({'relative_dir': rel, 'reason': str(exc)})
                 except Exception as exc:
                     # Remove partially written frame files; never publish an incomplete capture folder.
-                    bad = within(stage, storage)
-                    if bad.exists(): shutil.rmtree(bad)
+                    for bad in written:
+                        if bad.exists(): shutil.rmtree(bad)
                     with self.lock: self.job['errors'].append({'relative_dir': rel, 'error': str(exc)})
                     if mode == 'generate':
                         with self.lock:
@@ -728,24 +948,34 @@ class Workspace:
                         'export_policy': EXPORT_POLICY,
                         'frames': [{**row, 'has_cloud': True, 'input_mode': input_mode(report),
                                     'primary_ply': row['current_ply'], 'primary_npz': row['current_npz'],
-                                    'original_primary_ply': primary_ply(report), 'camera': report.get('camera', {}),
+                                    'original_primary_ply': '' if split else primary_ply(report), 'camera': report.get('camera', {}),
                                     'reviewed': report['reviewed'], 'points': report['stats']['points'],
-                                    'has_alignment': alignment_status(within(stage, row['storage_relative_dir'])),
-                                    'has_cleaning': (within(stage, row['storage_relative_dir'])/'pointcloud_cleaning.json').is_file(),
+                                    'has_alignment': 'alignment' in row['exported_stages'] and row['exported_stages']['alignment']['has_output'] if split else alignment_status(within(stage, row['storage_relative_dir'])),
+                                    'has_cleaning': 'cleaning' in row['exported_stages'] if split else (within(stage, row['storage_relative_dir'])/'pointcloud_cleaning.json').is_file(),
                                     'has_features': (within(stage, row['storage_relative_dir'])/'geometry_features.json').is_file(),
                                     'cloud_decision': row.get('cloud_decision', 'pending') if mode == 'export' else 'pending'} for row, report in completed]}
             manifest['aligned_only'] = self.job['aligned_only']
             manifest['group_by_decision'] = self.job['group_by_decision']
             manifest['decisions'] = self.job['decisions']
+            manifest['stages'] = self.job['stages']
+            manifest['export_layout'] = self.job['export_layout']
+            if split:
+                manifest.update(package_kind='stage_products', editable=False,
+                    coordinate_system='per_stage',
+                    export_policy='only each stage\'s current products and lightweight provenance; no original dependencies or edit history')
+                for frame in manifest['frames']:
+                    frame['has_cloud'] = any('primary_ply' in value['files'] for value in frame['exported_stages'].values())
             write_json(stage/'pointcloud_dataset.json', manifest)
             if mode == 'export':
                 from .features import aggregate
-                aggregate(stage, completed)
+                if not split:
+                    aggregate(stage, completed)
                 exported = {row['relative_dir']: row['storage_relative_dir'] for row, _ in completed}
                 completed_rows = {row['relative_dir']: row for row, _ in completed}
                 screening = []
                 for row in review_scope:
-                    decision = row.get('cloud_decision', 'pending')
+                    actual = completed_rows.get(row['relative_dir'], row)
+                    decision = actual.get('cloud_decision', 'pending')
                     reason = '' if row['relative_dir'] in exported else (
                         '未勾选此状态' if self.job['decisions'] is not None and decision not in self.job['decisions']
                         else '尚未对齐' if self.job['aligned_only'] and not row.get('has_alignment')
@@ -754,9 +984,9 @@ class Workspace:
                     screening.append({'relative_dir': row['relative_dir'], 'pig_id': row['pig_id'],
                         'capture_id': row['capture_id'], 'input_mode': row.get('cloud_input_mode') or row.get('input_mode'),
                         'decision': decision, 'status': {'keep':'保留','pending':'待定','reject':'淘汰'}[decision],
-                        'has_alignment': row.get('has_alignment', False), 'exported': row['relative_dir'] in exported,
-                        'has_cleaning': row.get('has_cleaning', False), 'removed_points': row.get('removed_points', 0),
-                        **{k: row.get(k, '') for k in ('current_ply', 'current_npz', 'current_coordinates', 'current_points')},
+                        'has_alignment': actual.get('has_alignment', False), 'exported': row['relative_dir'] in exported,
+                        'has_cleaning': actual.get('has_cleaning', False), 'removed_points': row.get('removed_points', 0),
+                        **{k: actual.get(k, '') for k in ('current_ply', 'current_npz', 'current_coordinates', 'current_points')},
                         'cloud_review_stale': row.get('cloud_review_stale', False),
                         **{k: completed_rows.get(row['relative_dir'], row).get(k, False if k == 'measurement_ready' else 0)
                            for k in ('measurement_ready', 'measurement_usable_slices', 'measurement_slice_count')},
@@ -768,13 +998,87 @@ class Workspace:
                     writer = csv.DictWriter(stream, fieldnames=list(screening[0]))
                     writer.writeheader()
                     writer.writerows(screening)
+                if self.job['stages'] is not None:
+                    stage_rows = []
+                    for row in review_scope:
+                        states = row.get('workflow_stages', {})
+                        exported_stages = completed_rows.get(row['relative_dir'], {}).get('exported_stages', {})
+                        for key in self.job['stages']:
+                            value = states.get(key, {})
+                            stage_rows.append({'relative_dir': row['relative_dir'], 'pig_id': row['pig_id'],
+                                'capture_id': row['capture_id'], 'stage': key, 'stage_label': STAGE_LABELS[key],
+                                'decision': value.get('decision', 'pending'),
+                                'status': REVIEW_GROUPS[value.get('decision', 'pending')],
+                                'exported': key in exported_stages,
+                                'blocked_by': value.get('blocked_by', ''),
+                                'has_output': value.get('has_output', False),
+                                'storage_relative_dir': completed_rows.get(row['relative_dir'], {}).get('stage_storage_relative_dirs', {}).get(key, exported.get(row['relative_dir'], '')) if key in exported_stages else '',
+                                'files': exported_stages.get(key, {}).get('files', {})})
+                    write_json(stage/'stage_screening.json', {'schema_version': 1, 'stages': self.job['stages'], 'frames': stage_rows})
+                    with (stage/'stage_screening.csv').open('w', encoding='utf-8-sig', newline='') as stream:
+                        writer = csv.DictWriter(stream, fieldnames=list(stage_rows[0]))
+                        writer.writeheader()
+                        writer.writerows(stage_rows)
+            if split:
+                for key in self.job['stages']:
+                    root = stage/STAGE_LABELS[key]
+                    frames = []
+                    for capture, report in stage_copies:
+                        if key not in capture['exported_stages']:
+                            continue
+                        capture = {**capture, 'storage_relative_dir': Path(capture['storage_relative_dir']).relative_to(STAGE_LABELS[key]).as_posix()}
+                        frames.append((capture, report))
+                    if not frames:
+                        shutil.rmtree(root)
+                        continue
+                    child_frames = []
+                    for capture, _ in frames:
+                        original = next(r for r in manifest['frames'] if r['relative_dir'] == capture['relative_dir'])
+                        child = {**original, **capture}
+                        child.pop('stage_storage_relative_dirs', None)
+                        child.update(primary_ply=capture['current_ply'], primary_npz=capture['current_npz'],
+                                     has_cloud=bool(capture['current_ply']),
+                                     has_features=(root/capture['storage_relative_dir']/'geometry_features.json').is_file())
+                        child_frames.append(child)
+                    child_manifest = {**manifest, 'frames': child_frames, 'stages': [key],
+                                      'output': str(target/STAGE_LABELS[key])}
+                    coordinates = {r['current_coordinates'] for r in child_frames}
+                    child_manifest['coordinate_system'] = next(iter(coordinates)) if len(coordinates) == 1 else 'per_frame'
+                    write_json(root/'pointcloud_dataset.json', child_manifest)
+                    measured_frames = [(capture, report) for capture, report in frames
+                                       if key == 'review' and capture['exported_stages'][key]['has_output']]
+                    if measured_frames:
+                        aggregate(root, measured_frames)
+                    records = [{**r, 'storage_relative_dir': Path(r['storage_relative_dir']).relative_to(STAGE_LABELS[key]).as_posix() if r['storage_relative_dir'] else ''}
+                               for r in stage_rows if r['stage'] == key]
+                    write_json(root/'stage_screening.json', {'schema_version': 1, 'stages': [key], 'frames': records})
+                    with (root/'stage_screening.csv').open('w', encoding='utf-8-sig', newline='') as stream:
+                        writer = csv.DictWriter(stream, fieldnames=list(records[0]))
+                        writer.writeheader()
+                        writer.writerows(records)
             if mode == 'generate':
                 write_json(stage/'input_validation.json', self.validation_report())
             final_job = {**copy.deepcopy(self.job), 'status': status, 'current': '已按原相对目录保存全部成果'}
             write_json(stage/'export.json', final_job)
-            links = ''.join(f'<li><a href="{quote(row["storage_relative_dir"], safe="/")}/{"processing_preview.html" if row.get("has_cleaning") else "body_preview.html" if row["has_alignment"] else "preview.html"}">{escape(row["storage_relative_dir"])}</a> · 主点云 <a href="{quote(row["storage_relative_dir"], safe="/")}/{row["primary_ply"]}">{row["primary_ply"]}</a> · 当前 {row["current_points"]:,} 点 · {"测量已复核" if row["measurement_ready"] else "测量待复核"}</li>' for row in manifest['frames'])
-            feature_link = '<p><a href="geometry_features.csv">批量几何特征 CSV</a>；已对齐采集目录另含 geometry_features.json、profile_sequence.csv / npz（缺失值与复核掩码分别保存）。</p>' if mode == 'export' else ''
-            (stage/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>点云成果</title><style>body{font:16px system-ui;margin:40px;line-height:2}a{color:#167b6b}</style><h1>毫米点云成果</h1><p>每次采集的 PLY、NPZ、检查图和生成记录均保存在对应文件夹。</p>'+feature_link+'<ul>'+links+'</ul>', encoding='utf-8')
+            index_frames = [{**row, 'primary_ply': row['current_ply']} for row, _ in stage_copies] if split else manifest['frames']
+            links = ''.join(f'<li><a href="{quote(row["storage_relative_dir"], safe="/")}/{"processing_preview.html" if row.get("has_cleaning") else "body_preview.html" if row["has_alignment"] else "preview.html"}">{escape(row["storage_relative_dir"])}</a> · 主点云 <a href="{quote(row["storage_relative_dir"], safe="/")}/{row["primary_ply"]}">{row["primary_ply"]}</a> · 当前 {row["current_points"]:,} 点 · {"测量已复核" if row["measurement_ready"] else "测量待复核"}</li>' for row in index_frames)
+            feature_link = '<p><a href="geometry_features.csv">批量几何特征 CSV</a>；已导出的测量阶段目录含 geometry_features.json、profile_sequence.csv / npz（缺失值与复核掩码分别保存）。</p>' if mode == 'export' else ''
+            description = '每次采集的 PLY、NPZ、检查图和生成记录均保存在对应文件夹。'
+            if split:
+                links = ''
+                for row, _ in stage_copies:
+                    key = next(iter(row['exported_stages']))
+                    files = {**row['exported_stages'][key]['files'],
+                             'stage_record': 'stage_result.json', 'workflow': 'workflow_stages.json'}
+                    products = ' · '.join(f'<a href="{quote(row["storage_relative_dir"]+"/"+name, safe="/")}">{escape(name)}</a>'
+                                          for name in files.values())
+                    links += f'<li>{escape(row["storage_relative_dir"])} · {products}</li>'
+                feature_link = ('<p><a href="'+quote(STAGE_LABELS['review'], safe='')+'/geometry_features.csv">测量复核批量几何特征 CSV</a></p>'
+                                if (stage/STAGE_LABELS['review']/'geometry_features.csv').is_file() else '')
+                description = '各阶段仅包含本阶段成果和轻量来源记录；测量复核不重复保存点云。此精简包用于交付和分析，继续编辑请使用原成果目录或按采集合并的完整导出目录。'
+            if self.job['stages'] is not None:
+                feature_link += '<p><a href="stage_screening.csv">各阶段筛选 CSV</a> · <a href="stage_screening.json">各阶段筛选 JSON</a>；各采集的 workflow_stages.json 列出阶段结论和成果文件。</p>'
+            (stage/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>点云成果</title><style>body{font:16px system-ui;margin:40px;line-height:2}a{color:#167b6b}</style><h1>毫米点云成果</h1><p>'+description+'</p>'+feature_link+'<ul>'+links+'</ul>', encoding='utf-8')
             if target.exists() or target.is_symlink(): raise ValueError('目标文件夹已被创建，请换名重试')
             stage.rename(target)
             stage = None
@@ -788,6 +1092,9 @@ class Workspace:
                 else:
                     for row, _ in completed:
                         rel = row['relative_dir']
+                        if self.job['stages'] is not None:
+                            # A partial export cannot replace the full editable alignment association.
+                            continue
                         if not snapshot[rel].get('alignment_cached'):
                             continue
                         association = self.settings.get('aligned_results', {}).get(str(self.results_root), {}).get(rel)

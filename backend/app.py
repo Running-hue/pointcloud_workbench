@@ -147,8 +147,8 @@ def make_handler(workspace, token):
                     method = self.path.rsplit('/', 1)[1]
                     self.send(getattr(workspace.alignment, method)(payload))
                 elif self.path in {'/api/processing/context', '/api/processing/detect', '/api/processing/select',
-                                   '/api/processing/clear', '/api/processing/edit', '/api/processing/slices',
-                                   '/api/processing/review', '/api/processing/image_points', '/api/processing/features'}:
+                                   '/api/processing/clear', '/api/processing/edit',
+                                   '/api/processing/image_points', '/api/processing/features'}:
                     self.send(getattr(workspace.processing, self.path.rsplit('/', 1)[1])(payload))
                 elif self.path == '/api/generate': self.send(workspace.start(payload, 'generate'))
                 elif self.path == '/api/export': self.send(workspace.start(payload, 'export'))

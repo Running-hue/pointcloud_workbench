@@ -25,20 +25,19 @@ frontend/pages + frontend/assets
 
 1. **点云清理**：查看点云、检测候选、框选并确认删除或恢复原始点索引，保留历史。
 2. **坐标对齐**：确认地面、尾根、颈根与方向，保存毫米猪体坐标参考。同次采集可复用参考。
-3. **测量复核**：使用当前点集及已确认的猪体坐标逐片检查可见边界，记录可测/不可测、备注和测量汇总。
+3. **测量复核**：使用当前点集及已确认的猪体坐标按区域或逐片检查可见边界，记录可测/不可测、备注和测量汇总。
 
 源图像、分割文件、原始 `points.npz` 和原始 PLY 不改写。清理只改变保留的点索引，不平滑、不补洞、不移动点、不改变毫米尺度。界面为交互显示抽样；编辑、测量和导出使用完整点集。
 
-## 两类判断分别记录
+## 阶段筛选与测量验收
 
-- **采集筛选**：保留/待定/淘汰针对当前这条采集的当前完整点集及坐标参考，三个页签共用。保留表示继续采用采集，不代表测量已验收。确认对齐不自动保留。
-- **测量复核**：逐切片的待定/可测/不可测和备注。完整测量可用性由 `measurement_ready` 等汇总字段表达，不从采集筛选状态推断。
+- 清理／对齐／测量各自记录保留、待定、淘汰。`cloud_review.json` 沿用 schema_version=2，增加 `stages` 字典；每项含 decision、version、reviewed_at。旧未带 stages 的记录按其 processing_version 推断为清理或对齐阶段，不将一条旧结论复制到三项。
+- 清理版本绑定点集摘要；对齐版本另外绑定坐标参考；测量版本另外绑定参数、条件与逐片复核摘要。下游变化不影响上游结论；相关输入改变后本阶段待定，撤销至相同版本可恢复。
+- 前序有效淘汰会阻止后序操作和输出；修改前序结论后恢复。未完成后序不阻止上游导出。`workflow_state` 在状态、筛选、操作检查、导出计划中统一计算依赖。
+- 逐片可测／不可测与阶段筛选分别记录；`measurement_ready` 不从阶段保留推断。原始生成有效率不因删点修改。
+- 工作台“已采集完毕”由三阶段当前状态共同决定：每项均 `has_output=true`、`reviewed=true`、`decision=keep`、非 stale 且无 blocked_by，并且采集已有点云。阶段菜单仅保留全部、清理确认、清理与对齐确认、三阶段确认、手动跳过五项，确认条件逐级取前序交集，不随当前页签切换。整批进度使用全部载入采集作分母，筛选内完成数另行显示，均位于左栏顶部；它与逐片 `measurement_ready` 独立，不更改已有状态文件。筛选区展开状态只在浏览器本机记忆，隐藏时保留条件和勾选范围。
 
-采集筛选记录绑定原始点云哈希、清理点集摘要和坐标参考。点集或参考改变后旧结论显示待定；回到此前完全相同的版本可恢复对应结论。旧版未绑定处理版本的记录需要重新确认。仅改变备注或切片判断不改变点集筛选版本。
-
-切片确认绑定坐标参考、清理摘要及切片参数；这些变化后原切片确认不能直接沿用。原始生成有效率始终保持原口径，不因删点而改记为 100%。
-
-## 导出的当前主点云
+## 完整合并导出的当前主点云
 
 | 当前情况 | 主 PLY | 主 NPZ | 坐标系 |
 | --- | --- | --- | --- |
@@ -47,18 +46,20 @@ frontend/pages + frontend/assets
 | 无处理记录、已对齐 | `cloud_body_mm.ply` | `body_points.npz` | 猪体 |
 | 有处理记录、已对齐 | `cloud_cleaned_body_mm.ply` | `cleaned_body_points.npz` | 猪体 |
 
-清理和复核共用处理记录；尚未删点但保存了复核记录时，处理后文件仍包含全部原始点。三个工作页签不切换导出版本。导出弹窗可限定“仅已对齐”，并独立指定采集范围和采集筛选状态。
+清理和复核共用处理记录；尚未删点但保存了复核记录时，处理后文件仍包含全部原始点。导出弹窗独立选择 stages、采集范围、各阶段 decisions。每条采集只输出符合状态且未被前序淘汰阻断的阶段；主文件由本次实际输出阶段决定。仅清理使用相机坐标，包含对齐／测量成果使用猪体坐标。测量仅在显式保存参数／条件／剖面判断后纳入自动导出，不因确认坐标或删点自动开始。
 
-原始文件、处理记录和已确认对齐文件作为追溯资料一并保存。读取下游特征时应先看主文件清单，不能把目录中的任意一个 PLY 当作最新版本。
+原始文件以及所选阶段计算所需的处理／对齐依赖作为追溯资料保存。未输出测量时，副本不含测量产品且清理记录的 measurement 清空；未输出对齐／测量时，副本移除对齐文件。全部操作发生在新副本，源处理与缓存不改写。部分导出不替换工作台完整对齐关联。读取下游特征时应先看主文件清单，不能把目录中的任意一个 PLY 当作最新版本。
 
 | 清单 | 含义 |
 | --- | --- |
 | 每次采集的 `pointcloud.json` | 原始点云生成数据、标定、来源和原始统计 |
 | 每次采集的 `current_pointcloud.json` | 当前主 PLY/NPZ、坐标、点数、处理版本及测量复核状态 |
-| 每次采集的 `cloud_review.json` | 绑定处理版本的采集筛选记录 |
+| 每次采集的 `cloud_review.json` | 各阶段独立筛选记录及版本；decision 为兼容摘要 |
+| 每次采集的 `workflow_stages.json` | 本次实际导出阶段、各阶段状态和文件路径 |
+| 根目录的 `stage_screening.json/csv` | 每条采集各所选阶段的结论、阻断来源与导出路径 |
 | 每次采集的 `pointcloud_cleaning.json`、`point_edits.npz` | 清理索引、历史和复核记录 |
 | 每次采集的 `alignment.json` | 坐标参考及变换矩阵 |
-| 每次采集的 `measurement_summary.json`、`slice_measurements.csv` | 测量汇总、逐片候选与确认值 |
+| 每次采集的 `measurement_summary.json`、`profile_sequence.csv/npz` | 测量汇总、逐片候选与确认值 |
 | 每次采集的 `geometry_features.json`、`profile_sequence.csv/npz` | 当前保留完整点集的几何候选、局部法向序列、单位与缺失/复核掩码 |
 | 根目录的 `geometry_features.csv` | 批量几何表、相机/模态、输入版本、条件与质量统计；真实体重留空待关联 |
 | 根目录的 `pointcloud_dataset.json` | 导出采集及各条 `primary_ply`、`primary_npz`、坐标等信息 |
@@ -66,4 +67,27 @@ frontend/pages + frontend/assets
 
 具体几何定义、数据数组及操作步骤见 [使用手册](user-guide.md)。
 
-新剖面通过 `/api/processing/features` 计算及保存参数与独立复核，身份、版本和保存回滚遵循原处理服务。参数与条件存于 `measurement.feature_settings`、`feature_quality`，标记存于 `feature_reviews`，不复用 `slice_reviews`；旧 `measurement_ready` 语义保留。仅计算不写文件，显式保存才写处理缓存；导出用同模块重新计算，原始点索引和主点云选择规则不变。详细公式和掩码见 [特征说明](features.md)。
+新剖面通过 `/api/processing/features` 计算及保存参数与独立复核，身份、版本和保存回滚遵循原处理服务。参数存于 `measurement.feature_settings`，标记存于 `feature_reviews`，不复用 `slice_reviews`；`measurement_ready`、左侧确认片数和导出汇总统一由当前剖面结果计算，不读取旧直线切片确认。仅计算不写文件，显式保存才写处理缓存；导出用同模块重新计算，原始点索引和主点云选择规则不变。
+
+端点与地面由当前已确认对齐默认提供 `complete/reliable`，计算与导出一致，来源记录为 `provenance.reference_conditions_source=confirmed_alignment_default`。历史 `feature_quality` 仅保留作追溯，读取不重写；旧请求的 `conditions` 仍验证格式，但不改变有效条件或重置剖面标记。删点、参数或坐标参考变化仍使对应剖面标记失效，默认参考不绕过数值缺失或中心线缺支撑检查。
+
+批量复核在同一路由提交 `profile_range: [first,last]` 与 `status: usable/unusable/pending`，使用从 0 开始的闭区间。一次请求校验全部范围，合并范围内标记后原子保存一次，区间外标记不变；失败回滚，旧 revision 拒绝写入。批量 `usable` 跳过宽度不可算的剖面并保留其原状态，返回 `review_update.updated/skipped`；单片确认仍拒绝不可算剖面，批量淘汰／待定可覆盖缺失片。详细公式和掩码见 [特征说明](features.md)。
+
+## 精简阶段交付包
+
+导出请求使用 `export_layout: split/merged`，省略时兼容原有 merged 行为；界面默认 split。新 split 标为 `package_kind: stage_products`，按“阶段中文名／该阶段状态／原采集路径”写该阶段产品，直接由当前完整源点集和已保存版本生成，不经完整副本复制。白名单如下：
+
+| 阶段 | 本阶段成果 |
+| --- | --- |
+| 点云清理 | `cloud_cleaned_mm.ply`、`cleaned_points.npz`、`pointcloud_cleaning.json` 轻量清理摘要；相机坐标，NPZ 含原始行索引 |
+| 坐标对齐 | `cloud_body_mm.ply`、`body_points.npz`、`alignment.json`；当前保留点的猪体坐标，NPZ 含原始行索引 |
+| 测量复核 | `geometry_features.json`、`profile_sequence.csv/npz`、`measurement_summary.json`；无 PLY／NPZ 点云副本 |
+| 各阶段共有轻量文件 | `stage_result.json` 记录来源哈希、当前版本和产品映射，`workflow_stages.json` 记录阶段结论与产品路径 |
+
+阶段之间不复制原始点云、检查图、预览嵌入点集或撤销历史。批量几何 CSV 仅位于 `测量复核/geometry_features.csv`，根目录不再重复写一份。仅有筛选记录而没有实际产出的阶段只写轻量清单，不伪造点云或特征；复核阶段的 `primary_ply/primary_npz`、`current_ply/current_npz` 为空，不标记为可编辑点云。单条任一阶段写入失败会撤掉该条全部不完整阶段产物，其他采集继续导出。源数据和缓存不改写。
+
+总清单仍为每次采集一条，以 `stage_storage_relative_dirs` 链接各阶段；`stage_screening` 是逐阶段判断和实际输出的清单。根目录及各阶段 `index.html` 提供文件链接。新精简包供分析／交付，载入工作台时明确提示打开原工程或 merged 完整导出继续编辑；原来未带 `package_kind=stage_products` 的完整 split 和 merged 保持载入兼容。
+
+merged 按本次输出的最后一阶段状态分类，保留原始文件、完整处理历史、依赖和离线预览；根目录继续输出批量几何表。POST /api/review_cloud 由前端提交 stage 与 stage_version，防止旧界面确认已变化的数据；POST /api/export 提交 stages，后端重复校验阶段、依赖与状态。前端不再提供或提交 `aligned_only` 条件，后端仍接受旧调用的该参数。旧调用未传 stages 时仍兼容旧导出约定，已有阶段记录时默认按三阶段处理。
+
+连续框选沿用 `/api/processing/select`，新增可选 `append: true` 与当前 `candidate_id`；省略 append 时保持旧的替换行为。候选编号校验防止旧选区追加，同操作按完整原始点索引取并集并去重，跨视角仍对应同一点集；删除与恢复切换时重建候选。确认一次对应一条可撤销历史；前端确认后保留框选模式，Esc 仅退出模式，clear 清空候选。未确认的候选仍不持久化。

@@ -11,7 +11,7 @@ import io
 import json
 import numpy as np
 
-VERSION = 'visible-surface-features-v1'
+VERSION = 'visible-surface-features-v2'
 FEATURE_FILES = {'geometry_features.json', 'profile_sequence.csv', 'profile_sequence.npz'}
 DEFAULTS = {'count': 32, 'thickness_mm': 20., 'min_points': 20, 'grid_mm': 10.}
 QUALITY = {'endpoints': 'unknown', 'ground': 'unknown'}
@@ -21,7 +21,10 @@ CHANNELS = {
     'transverse_curvature_per_mm': '1/mm', 'bulge_mm': 'mm',
     'point_count': 'count', 'transverse_bin_coverage': 'ratio',
     'fit_rmse_mm': 'mm',
+    'visible_transverse_arc_mm': 'mm',
 }
+ARC_BIN_MM = 5.
+ARC_MIN_BIN_POINTS = 2
 GEOMETRY_FIELDS = ('endpoint_ground_chord_mm', 'visible_centerline_arc_mm', 'centerline_arc_chord_ratio',
     'profile_width_median_mm', 'profile_width_max_mm', 'profile_width_p90_mm',
     'width_25pct_mm', 'width_50pct_mm', 'width_75pct_mm', 'visible_height_p95_mm',
@@ -120,6 +123,35 @@ def _shape(u, z, low, high):
     return curvature, bulge, error, coverage
 
 
+def _visible_transverse_arc(u, z, low, high):
+    """Length of an observed transverse median polyline, never across gaps.
+
+    Use the same 2--98% lateral range as width. Bin medians suppress duplicate
+    samples along the finite-thickness band; endpoints are the first/last
+    supported median nodes, with no extrapolation to the width limits.
+    """
+    if high-low < 10:
+        return None, 'narrow_span', 0
+    count = int(np.clip(np.ceil((high-low)/ARC_BIN_MM), 2, 256))
+    take = (u >= low) & (u <= high)
+    u, z = u[take], z[take]
+    edges = np.linspace(low, high, count+1)
+    bins = np.minimum(np.searchsorted(edges, u, side='right')-1, count-1)
+    nodes = []
+    for i in range(count):
+        selected = bins == i
+        if np.count_nonzero(selected) < ARC_MIN_BIN_POINTS:
+            return None, 'transverse_gap_or_sparse_bin', count
+        nodes.append([float(np.median(u[selected])), float(np.median(z[selected]))])
+    delta = np.diff(np.asarray(nodes), axis=0)
+    # A large vertical jump may join disconnected surfaces despite XY coverage.
+    # This conservative threshold is an implementation guard, not calibrated
+    # anatomical evidence that the remaining surface is complete.
+    if np.any(np.abs(delta[:, 1]) > np.maximum(20., 4*delta[:, 0])):
+        return None, 'transverse_height_jump', count
+    return float(np.hypot(delta[:, 0], delta[:, 1]).sum()), '', count
+
+
 def profile_selection(points, row, config, length_mm):
     p = np.asarray(points)
     delta = p[:, :2]-[row['center_x_mm'], row['center_y_mm']]
@@ -164,6 +196,8 @@ def calculate(points, length_mm, config=None, conditions=None, reviews=None, pro
             status = 'pending'
         low, high = np.percentile(u, [2, 98]) if available else (None, None)
         curve, bulge, error, coverage = _shape(u, z, low, high) if available else (None, None, None, None)
+        transverse_arc, arc_reason, arc_bins = (_visible_transverse_arc(u, z, low, high) if available
+            else (None, 'profile_unavailable', 0))
         h = float(np.percentile(z, 95)) if available else None
         row = {'index': i, 'fraction': float(f), 'arc_position_mm': float(s),
                'center_x_mm': float(x), 'center_y_mm': float(y),
@@ -175,6 +209,9 @@ def calculate(points, length_mm, config=None, conditions=None, reviews=None, pro
                'relative_height_p95_mm': h-reference_z if available else None,
                'height_gradient': None, 'transverse_curvature_per_mm': curve,
                'bulge_mm': bulge, 'fit_rmse_mm': error, 'transverse_bin_coverage': coverage,
+               'visible_transverse_arc_mm': transverse_arc,
+               'visible_transverse_arc_missing_reason': arc_reason,
+               'visible_transverse_arc_bin_count': arc_bins,
                'missing_reason': '' if available else 'centerline_gap' if not supported[i] else 'insufficient_points'}
         rows.append(row)
     fixed_rows, rows = rows[config['count']:], rows[:config['count']]
@@ -232,10 +269,19 @@ def calculate(points, length_mm, config=None, conditions=None, reviews=None, pro
             'quality': {'input_retained_points': original_count, 'points_in_endpoint_interval': len(p),
                         'sequence_position_valid': full_path,
                         'computable_profiles': len(good_rows), 'reviewed_profiles': sum(r['status'] == 'usable' for r in rows),
+                        'computable_transverse_arcs': sum(r['visible_transverse_arc_mm'] is not None
+                            and r['status'] != 'unusable' for r in rows),
                         'all_profiles_reviewed': all_reviewed, 'warnings': warnings},
             'definitions': {'width': 'local normal-plane visible 2–98 percentile lateral span, not anatomical full width',
                             'height': 'p95 Z relative to reviewed local ground; not necessarily gravitational vertical',
                             'relative_height': 'profile p95 Z minus retained interval global p05 Z',
+                            'visible_transverse_arc': {
+                                'method': 'polyline length through transverse-bin median (u,Z) nodes inside lateral P02--P98; first/last median endpoints; no extrapolation or gap bridging; not girth',
+                                'target_bin_mm': ARC_BIN_MM, 'maximum_bins': 256,
+                                'minimum_points_per_bin': ARC_MIN_BIN_POINTS,
+                                'minimum_width_mm': 10.,
+                                'maximum_vertical_step': 'max(20 mm, 4 * adjacent median horizontal distance)',
+                            },
                             'area': 'occupied XY grid cells times cell area; holes unfilled; resolution dependent',
                             'integral': 'positive median Z per occupied XY cell times cell area; visible-surface proxy, not body volume',
                             'mask': 'valid = numerically available; usable = valid and not rejected; reviewed = explicit boundary confirmation',

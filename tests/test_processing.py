@@ -94,6 +94,57 @@ class ProcessingWorkflowTest(unittest.TestCase):
         self.proc['revision'] = response['revision']
         return response
 
+    def test_continuous_rectangles_accumulate_unique_indices_across_views_and_undo(self):
+        self.context()
+        with np.load(self.folder/'points.npz') as cloud:
+            points = cloud['xyz_mm'].copy()
+        first_view = {'rotation': np.eye(3).tolist(), 'center': [0,0,1200], 'scale': 1, 'size': [2000,2000]}
+        second_view = {**first_view, 'rotation': [[0,1,0],[-1,0,0],[0,0,1]]}
+        rectangles = [(first_view, [950,970,1000,1030]), (second_view, [970,970,1030,1000])]
+        candidate, expected = '', np.zeros(len(points), bool)
+        for index, (view, rectangle) in enumerate(rectangles + rectangles[:1]):
+            expected |= screen_selection(points, view, rectangle)
+            selected = self.ws.processing.select({**self.proc, 'action': 'remove', 'append': True,
+                'candidate_id': candidate, 'view': view, 'rectangle': rectangle})
+            candidate = selected['candidate_id']
+            self.assertEqual(selected['candidate_count'], int(expected.sum()))
+            self.assertEqual(selected['candidate_detail']['rectangle_count'], index+1)
+        removed = self.apply_selection(selected)
+        self.assertEqual(removed['removed_count'], int(expected.sum()))
+        self.assertEqual(removed['candidate_count'], 0)
+        # A new round starts from an empty candidate and excludes deleted points.
+        more = self.ws.processing.select({**self.proc, 'action': 'remove', 'append': True, 'candidate_id': '',
+            'view': first_view, 'rectangle': [1000,1000,1040,1030]})
+        expected_more = screen_selection(points, first_view, [1000,1000,1040,1030]) & ~expected
+        self.assertEqual(more['candidate_count'], int(expected_more.sum()))
+        self.assertGreater(more['candidate_count'], 0)
+        after = self.apply_selection(more)
+        self.assertEqual(after['removed_count'], int((expected | expected_more).sum()))
+        undone = self.ws.processing.edit({**self.proc, 'operation': 'undo'})
+        self.proc['revision'] = undone['revision']
+        self.assertEqual(undone['removed_count'], int(expected.sum()))
+        restored = self.ws.processing.select({**self.proc, 'action': 'restore', 'append': True, 'candidate_id': '',
+            'view': first_view, 'rectangle': [950,970,1000,1030]})
+        restored_again = self.ws.processing.select({**self.proc, 'action': 'restore', 'append': True,
+            'candidate_id': restored['candidate_id'], 'view': second_view, 'rectangle': [970,970,1030,1000]})
+        self.assertEqual(restored_again['candidate_count'], int(expected.sum()))
+        self.assertEqual(self.apply_selection(restored_again)['removed_count'], 0)
+
+    def test_continuous_selection_rejects_stale_ids_and_switching_action_replaces_candidate(self):
+        self.context()
+        selected = self.select_some()
+        payload = {**self.proc, 'append': True, 'candidate_id': selected['candidate_id'], 'action': 'restore',
+            'view': {'rotation': np.eye(3).tolist(), 'center': [0,0,1200], 'scale': 1, 'size': [2000,2000]},
+            'rectangle': [0,0,999,2000]}
+        with self.assertRaisesRegex(ValueError, '选区已变化'):
+            self.ws.processing.select({**payload, 'candidate_id': 'stale'})
+        with self.assertRaisesRegex(ValueError, '连续框选'):
+            self.ws.processing.select({**payload, 'append': 'true'})
+        restored = self.ws.processing.select(payload)
+        self.assertEqual(restored['candidate_count'], 0)
+        self.assertEqual(restored['candidate_action'], 'restore')
+        self.assertEqual(restored['candidate_detail']['rectangle_count'], 1)
+
     def test_edits_undo_redo_restore_and_restart_leave_originals_untouched(self):
         before = {p.name: sha256(p) for p in self.folder.iterdir() if p.is_file()}
         self.context()
@@ -176,12 +227,14 @@ class ProcessingWorkflowTest(unittest.TestCase):
         self.assertEqual(self.ws.row(self.base['id'])['cloud_decision'], 'pending')
         self.ws.review_cloud({**self.base, 'decision': 'keep'})
         self.context()
-        response = self.ws.processing.review({**self.proc, 'thickness_mm': 100, 'min_points': 3})
+        self.assertEqual(self.ws.row(self.base['id'])['measurement_slice_count'], 32)
+        response = self.ws.processing.features({**self.proc, 'settings': {'count': 16, 'thickness_mm': 100, 'min_points': 3},
+            'conditions': {'endpoints': 'complete'}})
         self.proc['revision'] = response['revision']
-        rows = self.ws.processing.slices(self.proc)['rows']
-        self.assertTrue(all(row['point_support_sufficient'] for row in rows))
+        rows = response['features']['profiles']
+        self.assertTrue(all(row['width_q02_q98_mm'] is not None for row in rows))
         for row in rows:
-            response = self.ws.processing.review({**self.proc, 'slice_index': row['index'], 'status': 'usable'})
+            response = self.ws.processing.features({**self.proc, 'profile_index': row['index'], 'status': 'usable'})
             self.proc['revision'] = response['revision']
         state = self.ws.row(self.base['id'])
         self.assertEqual(state['cloud_decision'], 'keep')
@@ -200,8 +253,7 @@ class ProcessingWorkflowTest(unittest.TestCase):
         self.assertTrue(selected['measurement_ready'])
         self.assertTrue(read_json(output/'cloud_screening.json')['frames'][0]['measurement_ready'])
         self.assertEqual(read_json(output/'pointcloud_dataset.json')['coordinate_system'], 'ground_body')
-        # Existing portable reviews predate the progress summary; restoring them
-        # must show the same acceptance as the slice records without rewriting them.
+        # Rebuild summaries from profile labels on reopen without rewriting records.
         legacy = read_json(dest/'pointcloud_cleaning.json')
         legacy['measurement'].pop('review_summary')
         write_json(dest/'pointcloud_cleaning.json', legacy)
@@ -292,8 +344,10 @@ class ProcessingWorkflowTest(unittest.TestCase):
         self.assertIn(b'coordinates ground_body', (dest/'cloud_cleaned_body_mm.ply').read_bytes()[:150])
         summary = read_json(dest/'measurement_summary.json')
         self.assertFalse(summary['measurement_ready'])
-        self.assertIsNone(summary['confirmed_envelope_area_mm2'])
-        self.assertTrue((dest/'slice_measurements.csv').is_file())
+        self.assertEqual(summary['measurement_method'], 'local_normal_profiles')
+        self.assertEqual(summary['slice_count'], 32)
+        self.assertFalse((dest/'slice_measurements.csv').exists())
+        self.assertTrue((dest/'profile_sequence.csv').is_file())
         page = (dest/'processing_preview.html').read_text()
         self.assertIn('OFFLINE_DATA=',page)
         self.assertNotIn('src="/processing.js"',page)

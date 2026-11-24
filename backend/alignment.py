@@ -19,6 +19,7 @@ from .core import (np, cv2, Image, backproject, project, sha256, read_json,
                    camera_identity, input_mode, sample_rgb)
 from .registration import rgb_timing, depth_to_color
 from .paths import TEMPLATES_DIR
+from .workflow import workflow_state
 
 VERSION = 'ground-body-mm-v1'
 SIDE_FILES = {'alignment.json', 'body_points.npz', 'cloud_body_mm.ply',
@@ -245,6 +246,9 @@ class AlignmentService:
         result = self.ws.results.get(row['relative_dir'])
         if not result:
             raise ValueError('请先生成或打开当前采集的点云')
+        if (result.get('cloud_review', {}).get('stages') is not None
+                and workflow_state(result)['alignment']['blocked_by']):
+            raise ValueError('点云清理已淘汰，本采集不再进入坐标对齐；可返回清理阶段修改结论')
         return row, result
 
     def _raw(self, payload, row, report):

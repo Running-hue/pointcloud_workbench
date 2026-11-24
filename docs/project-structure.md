@@ -33,13 +33,14 @@ pointcloud_workbench/
 | 文件 | 职责 |
 | --- | --- |
 | `backend/app.py` | 本机 HTTP 服务、页面与资源路由、请求鉴权、API 转发、服务启动 |
-| `backend/workspace.py` | 数据集载入、输入核对、采集筛选、后台生成任务、批量导出 |
+| `backend/workflow.py` | 三阶段独立筛选、版本、上游淘汰依赖与导出计划 |
+| `backend/workspace.py` | 数据集载入、输入核对、采集筛选、后台生成任务、完整／阶段交付包导出与清单 |
 | `backend/features.py` | 可见中心线、几何特征、局部法向序列、质量掩码与特征序列化 |
 | `backend/core.py` | 毫米几何、投影/反投影、输入校验、基础重建和点云文件输出 |
 | `backend/rgb.py` | RGB 分割对应的几何重建 |
 | `backend/registration.py` | RGB 与深度的配准核对、遮挡和时序检查 |
 | `backend/alignment.py` | 地面拟合、端点标注、猪体坐标、同次采集参考及对齐成果 |
-| `backend/processing.py` | 原始点索引上的删除/恢复、撤销/重做、切片测量和复核 |
+| `backend/processing.py` | 原始点索引上的删除/恢复、撤销/重做、切片测量和复核、按阶段白名单写成果 |
 | `backend/viewer.py` | 相机坐标离线预览的显示抽样和 HTML 生成 |
 | `backend/native_picker.py` | macOS/Windows 原生目录选择窗口及辅助进程 |
 | `backend/batch.py` | 已有命令行批量重建流程 |
@@ -51,7 +52,7 @@ pointcloud_workbench/
 
 | 文件 | 对应功能 |
 | --- | --- |
-| `frontend/pages/index.html`、`frontend/assets/js/workbench.js`、`frontend/assets/css/workbench.css` | 主工作台、采集列表、三步切换、采集筛选及导出弹窗 |
+| `frontend/pages/index.html`、`frontend/assets/js/workbench.js`、`frontend/assets/css/workbench.css` | 主工作台、采集列表、三步切换、阶段累计筛选、可收起筛选区、顶部完成进度及导出弹窗 |
 | `frontend/pages/alignment.html`、`frontend/assets/js/alignment.js`、`frontend/assets/css/alignment.css` | 地面/端点标注及坐标对齐 |
 | `frontend/pages/processing.html`、`frontend/assets/js/processing.js`、`frontend/assets/css/processing.css` | 点云查看与清理、测量复核，以及导出的只读处理预览 |
 | `frontend/templates/viewer.html` | 原始相机坐标离线预览模板 |
@@ -79,6 +80,7 @@ pointcloud_workbench/
 | --- | --- |
 | 本机目录设置、采集筛选、清理历史、对齐缓存 | 原项目根目录 `.state/`，不搬迁、不纳入 Git |
 | 默认导出父目录 | 原科研工作区 `outputs/`，仍是项目的同级目录 |
+| 导出组织方式 | 默认“阶段／状态／原采集路径”精简产品包：清理仅相机点云，对齐仅猪体点云和矩阵，复核仅几何／剖面／汇总，附轻量来源清单；唯一批量几何表放在测量阶段根目录。可改为“状态／原采集路径”完整合并副本，保留原始文件和编辑历史 |
 | 原始采集、分割结果、用户选择的点云成果 | 继续使用工作台中选择的外部目录，不复制进源码目录 |
 | 已有 `.venv` | 原项目根目录 `.venv/`，启动脚本仍优先使用 |
 | 共享 OpenCV 等依赖 | 原同级 `segmentation_workbench/.deps/`，路径保持不变 |

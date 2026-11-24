@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import copy
 import base64
-import csv
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -21,6 +20,7 @@ from .core import np, cv2, Image, read_json, write_json, sha256, display_ir, ply
 from .alignment import alignment_status, transform_points
 from .paths import PAGES_DIR, JS_DIR, CSS_DIR
 from . import features as feature_math
+from .workflow import workflow_state
 
 VERSION = 'reversible-point-edits-v1'
 EDIT_FILES = {'pointcloud_cleaning.json', 'point_edits.npz'}
@@ -35,6 +35,22 @@ def now():
 
 def mask_digest(removed):
     return hashlib.sha256(np.packbits(removed).tobytes()).hexdigest()
+
+
+MEASUREMENT_METHOD = 'local_normal_profiles'
+# The confirmed alignment supplies both references. Capture screening handles
+# unsuitable endpoints/ground; these are no longer separate user decisions.
+REFERENCE_CONDITIONS = {'endpoints': 'complete', 'ground': 'reliable'}
+
+
+def profile_review_summary(features):
+    """Use the same evaluated profiles as the inspection panel and exports."""
+    return {'measurement_method': MEASUREMENT_METHOD,
+            'feature_version': feature_math.VERSION,
+            'slice_count': len(features['profiles']),
+            'usable_slices': features['quality']['reviewed_profiles'],
+            'unusable_slices': sum(row['status'] == 'unusable' for row in features['profiles']),
+            'measurement_ready': features['quality']['all_profiles_reviewed']}
 
 
 def scalar(value, low, high, label):
@@ -196,20 +212,20 @@ class ProcessingService:
                 try:
                     record, removed, history = self._read(folder, result)
                     m = record.get('measurement', {})
-                    # Upgrade display metadata for older valid reviews in memory.
-                    # Do not rewrite the user's saved processing record.
-                    if 'review_summary' not in m and result.get('has_alignment'):
+                    # Rebuild display metadata from current profiles in memory.
+                    # Historical straight-slice labels are never profile labels.
+                    if result.get('has_alignment'):
                         alignment = read_json(result['folder']/'alignment.json')
                         valid = (m.get('reference_id') == alignment['reference_id']
                                  and m.get('cleaning_digest') == mask_digest(removed))
-                        if valid:
+                        if valid and m.get('feature_reviews'):
                             with np.load(result['folder']/'points.npz', allow_pickle=False) as cloud:
                                 body = transform_points(cloud['xyz_mm'][~removed], alignment['frame'])
-                            rows, summary = measure_slices(body, alignment['frame']['neck_tail_horizontal_span_mm'],
-                                m.get('thickness_mm', 15), m.get('min_points', 20), m.get('slice_reviews'))
-                            record['measurement'] = {**m, 'review_summary': {'slice_count': len(rows),
-                                'usable_slices': summary['usable_slices'],
-                                'measurement_ready': all(row['status'] == 'usable' for row in rows)}}
+                            features = feature_math.calculate(body, alignment['frame']['neck_tail_horizontal_span_mm'],
+                                m.get('feature_settings'), REFERENCE_CONDITIONS, m.get('feature_reviews'))
+                            record['measurement'] = {**m, 'review_summary': profile_review_summary(features)}
+                        else:
+                            record['measurement'] = {k: v for k, v in m.items() if k != 'review_summary'}
                     result['processing'] = {'folder': folder, 'record': record}
                     break
                 except (ValueError, OSError, KeyError, TypeError, IndexError):
@@ -320,7 +336,7 @@ class ProcessingService:
         valid = saved.get('reference_id') == reference and saved.get('cleaning_digest') == mask_digest(ctx['removed'])
         return {**saved, 'slice_reviews': saved.get('slice_reviews', {}) if valid else {},
                 'feature_reviews': saved.get('feature_reviews', {}) if valid else {},
-                'feature_quality': saved.get('feature_quality', {}) if valid else {},
+                'feature_quality': dict(REFERENCE_CONDITIONS),
                 'reference_id': reference, 'cleaning_digest': mask_digest(ctx['removed'])}
 
     def _coordinates(self, ctx, body=False):
@@ -381,6 +397,12 @@ class ProcessingService:
             ctx, _ = self._ctx(payload)
             if payload.get('action') not in {'remove', 'restore'}:
                 raise ValueError('请选择删除或恢复点')
+            append = payload.get('append', False)
+            if not isinstance(append, bool):
+                raise ValueError('连续框选参数无效')
+            previous = ctx['candidate']
+            if append and payload.get('candidate_id', '') != (previous['id'] if previous else ''):
+                raise ValueError('选区已变化，请重新载入后框选')
             body = payload.get('coordinate') == 'body'
             selection = screen_selection(self._coordinates(ctx, body), payload.get('view', {}), payload.get('rectangle'))
             if payload.get('slice_only') is True:
@@ -389,8 +411,12 @@ class ProcessingService:
                 x = self._coordinates(ctx, True)[:, 0]
                 selection &= (x >= rows[i]['x_start_mm']) & ((x <= rows[i]['x_end_mm']) if i == len(rows)-1 else (x < rows[i]['x_end_mm']))
             selection &= ctx['removed'] if payload['action'] == 'restore' else ~ctx['removed']
+            same_action = append and previous and previous['action'] == payload['action']
+            if same_action:
+                selection[previous['indices']] = True
             ctx['candidate'] = {'id': secrets.token_hex(12), 'indices': np.flatnonzero(selection),
                 'action': payload['action'], 'detail': {'method': 'screen_rectangle', 'through_all_depths': True,
+                    'rectangle_count': (previous['detail'].get('rectangle_count', 0) if same_action else 0) + 1,
                     'coordinate': 'body' if body else 'camera', 'slice_only': payload.get('slice_only') is True}}
             return self._response(ctx)
 
@@ -411,10 +437,8 @@ class ProcessingService:
         target = parent/revision
         try:
             if ctx['alignment']:
-                rows, summary = self._slices(ctx)
-                ctx['measurement'] = {**self._measurement(ctx), 'review_summary': {
-                    'slice_count': len(rows), 'usable_slices': summary['usable_slices'],
-                    'measurement_ready': all(row['status'] == 'usable' for row in rows)}}
+                ctx['measurement'] = {**self._measurement(ctx),
+                    'review_summary': profile_review_summary(self._features(ctx))}
             ops = ctx['history']
             offsets = np.concatenate([[0], np.cumsum([len(op['indices']) for op in ops])]).astype(np.int64)
             indices = np.concatenate([op['indices'] for op in ops]) if ops else np.empty(0, np.int64)
@@ -502,7 +526,8 @@ class ProcessingService:
 
     def slices(self, payload):
         with self.ws.lock:
-            ctx, _ = self._ctx(payload)
+            ctx, result = self._ctx(payload)
+            self._require_review(result)
             rows, summary = self._slices(ctx)
             i_value = scalar(payload.get('slice_index', 0), 0, len(rows)-1, '切片编号')
             if i_value != int(i_value):
@@ -518,6 +543,11 @@ class ProcessingService:
                 'yz': points[idx, 1:].round(3).tolist(), 'indices': idx.tolist(),
                 'notes': self._measurement(ctx).get('notes', '')}
 
+    def _require_review(self, result):
+        if (result.get('cloud_review', {}).get('stages') is not None
+                and workflow_state(result)['review']['blocked_by']):
+            raise ValueError('前序阶段已淘汰，本采集不再进入测量复核；可返回前序阶段修改结论')
+
     def _features(self, ctx):
         if not ctx['alignment']:
             raise ValueError('请先确认地面、尾根与颈躯连接点，完成坐标对齐')
@@ -529,7 +559,8 @@ class ProcessingService:
             'input_mode': input_mode(ctx['report']), 'camera': ctx['report'].get('camera'),
             'original_valid_depth_ratio': ctx['report']['stats']['valid_depth_ratio'],
             'point_source': 'all retained immutable points; no preview sampling',
-            'feature_version': feature_math.VERSION}
+            'feature_version': feature_math.VERSION,
+            'reference_conditions_source': 'confirmed_alignment_default'}
         key = json.dumps([provenance, m.get('feature_settings'), m.get('feature_quality'), m.get('feature_reviews')], sort_keys=True)
         if ctx.get('feature_cache', {}).get('key') != key:
             result = feature_math.calculate(self._coordinates(ctx, True)[~ctx['removed']],
@@ -542,33 +573,52 @@ class ProcessingService:
         """Compute candidates; persist only explicit settings/quality/reviews."""
         with self.ws.lock:
             ctx, result = self._ctx(payload)
+            self._require_review(result)
             old = copy.deepcopy(ctx['measurement'])
             m = self._measurement(ctx)
             changed = any(k in payload for k in ('settings', 'conditions', 'status'))
             try:
+                if 'profile_range' in payload and 'status' not in payload:
+                    raise ValueError('批量剖面复核须选择确认、淘汰或待定状态')
+                if changed:
+                    m['measurement_started'] = True
                 if 'settings' in payload:
                     config = feature_math.settings(payload['settings'])
                     if config != feature_math.settings(m.get('feature_settings')):
                         m['feature_reviews'] = {}
                     m['feature_settings'] = config
                 if 'conditions' in payload:
-                    conditions = feature_math.quality(payload['conditions'])
-                    if conditions != feature_math.quality(m.get('feature_quality')):
-                        m['feature_reviews'] = {}
-                    m['feature_quality'] = conditions
+                    # Accept the historical request shape without reinstating
+                    # the removed selectors or erasing existing profile labels.
+                    feature_math.quality(payload['conditions'])
                 ctx['measurement'] = m
                 computed = self._features(ctx)
+                review_update = None
                 if 'status' in payload:
-                    if payload['status'] not in {'pending', 'usable', 'unusable'}:
+                    if not isinstance(payload['status'], str) or payload['status'] not in {'pending', 'usable', 'unusable'}:
                         raise ValueError('剖面复核状态无效')
-                    index = scalar(payload.get('profile_index'), 0, len(computed['profiles'])-1, '剖面编号')
-                    if index != int(index):
+                    count = len(computed['profiles'])
+                    batch = 'profile_range' in payload
+                    bounds = payload['profile_range'] if batch else [payload.get('profile_index')]*2
+                    if not isinstance(bounds, list) or len(bounds) != 2:
+                        raise ValueError('剖面范围须包含起始和结束编号')
+                    bounds = [scalar(v, 0, count-1, '剖面编号') for v in bounds]
+                    if any(v != int(v) for v in bounds):
                         raise ValueError('剖面编号须为整数')
-                    if payload['status'] == 'usable' and computed['profiles'][int(index)]['width_q02_q98_mm'] is None:
+                    first, last = map(int, bounds)
+                    if first > last:
+                        raise ValueError('起始剖面不能大于结束剖面')
+                    indices = list(range(first, last+1))
+                    skipped = [i for i in indices if payload['status'] == 'usable'
+                               and computed['profiles'][i]['width_q02_q98_mm'] is None]
+                    if skipped and not batch:
                         raise ValueError('该剖面点数或中心线支撑不足，不能确认为可测')
-                    m['feature_reviews'] = {**m.get('feature_reviews', {}), str(int(index)): payload['status']}
+                    updates = {str(i): payload['status'] for i in indices if i not in skipped}
+                    m['feature_reviews'] = {**m.get('feature_reviews', {}), **updates}
                     ctx['measurement'] = m
                     computed = self._features(ctx)
+                    review_update = {'profile_range': [first, last], 'status': payload['status'],
+                                     'updated': len(updates), 'skipped': skipped}
                 i = scalar(payload.get('profile_index', 0), 0, len(computed['profiles'])-1, '剖面编号')
                 if i != int(i):
                     raise ValueError('剖面编号须为整数')
@@ -597,19 +647,21 @@ class ProcessingService:
                 q = points[ids]
                 across = (q[:, :2]-[row['center_x_mm'], row['center_y_mm']]) @ [-row['tangent_y'], row['tangent_x']]
                 return {'features': computed, 'revision': ctx['revision'], 'profile_index': int(i),
+                        'review_update': review_update,
                         'profile_yz': np.column_stack([across, q[:, 2]]).round(3).tolist()}
             except Exception:
                 ctx['measurement'] = old
                 raise
 
-    def export_features_to(self, dest, result):
+    def export_features_to(self, dest, result, source_folder=None):
+        source = source_folder or dest
         for name in feature_math.FEATURE_FILES:
             if (dest/name).exists():
                 (dest/name).unlink()
-        if not alignment_status(dest):
+        if not alignment_status(source):
             return None
-        alignment = read_json(dest/'alignment.json')
-        with np.load(dest/'points.npz', allow_pickle=False) as saved:
+        alignment = read_json(source/'alignment.json')
+        with np.load(source/'points.npz', allow_pickle=False) as saved:
             points = saved['xyz_mm'].copy()
         removed, m = np.zeros(len(points), bool), {}
         if result.get('processing'):
@@ -622,11 +674,65 @@ class ProcessingService:
                             'feature_quality': m.get('feature_quality', {}) if valid else {},
                             'reference_id': alignment['reference_id'], 'cleaning_digest': digest},
             'row': {'relative_dir': result['report'].get('relative_dir', alignment.get('relative_dir', ''))},
-            'report': result['report'], 'points_hash': sha256(dest/'points.npz'),
-            'report_hash': sha256(dest/'pointcloud.json')}
+            'report': result['report'], 'points_hash': sha256(source/'points.npz'),
+            'report_hash': sha256(source/'pointcloud.json')}
         computed = self._features(ctx)
         feature_math.write_products(dest, computed)
+        write_json(dest/'measurement_summary.json', {**profile_review_summary(computed),
+            'reference_id': alignment['reference_id'], 'cleaning_digest': digest,
+            'settings': computed['settings'], 'conditions': computed['conditions']})
         return computed
+
+    def export_stage_to(self, dest, result, stage, has_output):
+        """Write delivery products directly, without copying editable dependencies."""
+        if not has_output:
+            return {}
+        if stage == 'review':
+            if self.export_features_to(dest, result, source_folder=result['folder']) is None:
+                raise ValueError('测量复核缺少有效坐标对齐，无法导出')
+            return {'geometry_json': 'geometry_features.json', 'sequence_csv': 'profile_sequence.csv',
+                    'sequence_npz': 'profile_sequence.npz', 'summary': 'measurement_summary.json'}
+        with np.load(result['folder']/'points.npz', allow_pickle=False) as saved:
+            cloud = {key: saved[key].copy() for key in saved.files}
+        record, removed = {}, np.zeros(len(cloud['xyz_mm']), bool)
+        if result.get('processing'):
+            record, removed, _ = self._read(result['processing']['folder'], result)
+        ids = np.flatnonzero(~removed)
+        current = {key: value[ids] for key, value in cloud.items()}
+        current['source_point_index'] = ids
+        color = display_ir(current['infrared_raw']) if input_mode(result['report']) == 'infrared' else current['rgb'].copy()
+        if input_mode(result['report']) != 'infrared':
+            color[~current['rgb_valid']] = [110, 120, 140]
+        if stage == 'cleaning':
+            files = {'primary_ply': 'cloud_cleaned_mm.ply', 'primary_npz': 'cleaned_points.npz',
+                     'cleaning': 'pointcloud_cleaning.json'}
+            write_json(dest/files['cleaning'], {'schema_version': 1, 'package_kind': 'stage_products',
+                'version': VERSION, 'cleaning_digest': mask_digest(removed),
+                'cleaning_revision': record.get('revision', 0),
+                'input_points_sha256': sha256(result['folder']/'points.npz'),
+                'original_points': len(removed), 'kept_points': len(ids), 'removed_points': int(removed.sum()),
+                'source_point_index': 'indices in the immutable input points.npz'})
+        elif stage == 'alignment':
+            if not alignment_status(result['folder']):
+                raise ValueError('坐标对齐成果不完整或已变化，无法导出')
+            alignment = read_json(result['folder']/'alignment.json')
+            current['xyz_mm'] = transform_points(current['xyz_mm'], alignment['frame']).astype(np.float32)
+            files = {'primary_ply': 'cloud_body_mm.ply', 'primary_npz': 'body_points.npz',
+                     'alignment': 'alignment.json'}
+        else:
+            raise ValueError('导出阶段无效')
+        np.savez_compressed(dest/files['primary_npz'], **current)
+        ply = ply_bytes(current, color)
+        if stage == 'alignment':
+            ply = ply.replace(b'coordinates native_depth_camera', b'coordinates ground_body', 1)
+        (dest/files['primary_ply']).write_bytes(ply)
+        if stage == 'alignment':
+            write_json(dest/files['alignment'], {**alignment,
+                'package_kind': 'stage_products', 'editable': False,
+                'source_body_points_sha256': alignment['body_points_sha256'],
+                'body_points_sha256': sha256(dest/files['primary_npz']),
+                'cleaning_digest': mask_digest(removed), 'retained_points': len(ids)})
+        return files
 
     def review(self, payload):
         with self.ws.lock:
@@ -744,19 +850,28 @@ class ProcessingService:
             return {'uv': uv.tolist(), 'shape_hw': [height, width],
                     'count': len(ids), 'pixel_coordinate_space': ctx['report'].get('pixel_coordinate_space', 'depth_native')}
 
-    def export_to(self, dest, result):
+    def export_to(self, dest, result, include_measurement=True):
         """Add derived products to a new export; keep original products intact."""
+        # Retire old derived tables only in the new exported copy.
+        if (dest/'slice_measurements.csv').exists():
+            (dest/'slice_measurements.csv').unlink()
         info = result.get('processing')
         if not info:
             # Invalid/unrestored sidecars must not masquerade as the current version.
             for name in PROCESSING_FILES:
                 if (dest/name).exists():
                     (dest/name).unlink()
-            self.export_features_to(dest, result)
+            if include_measurement:
+                self.export_features_to(dest, result)
             return
         r, removed, _ = self._read(info['folder'], result)
         for name in EDIT_FILES:
             shutil.copy2(info['folder']/name, dest/name)
+        if not include_measurement:
+            write_json(dest/'pointcloud_cleaning.json', {**r, 'measurement': {}})
+            for name in feature_math.FEATURE_FILES | {'measurement_summary.json'}:
+                if (dest/name).exists():
+                    (dest/name).unlink()
         with np.load(dest/'points.npz', allow_pickle=False) as saved:
             cloud = {k: saved[k].copy() for k in saved.files}
         ids = np.flatnonzero(~removed)
@@ -768,22 +883,15 @@ class ProcessingService:
             color[~cleaned['rgb_valid']] = [110, 120, 140]
         (dest/'cloud_cleaned_mm.ply').write_bytes(ply_bytes(cleaned, color))
         alignment = read_json(dest/'alignment.json') if alignment_status(dest) else None
-        rows, summary = [], {'measurement_ready': False, 'reason': '尚未建立猪体坐标'}
+        features = self.export_features_to(dest, result) if include_measurement else None
+        summary = (read_json(dest/'measurement_summary.json') if features else
+            {'measurement_method': MEASUREMENT_METHOD, 'slice_count': 0, 'usable_slices': 0,
+             'measurement_ready': False, 'reason': '尚未建立猪体坐标'})
         if alignment:
             body = {**cleaned, 'xyz_mm': transform_points(cleaned['xyz_mm'], alignment['frame']).astype(np.float32)}
             np.savez_compressed(dest/'cleaned_body_points.npz', **body)
             (dest/'cloud_cleaned_body_mm.ply').write_bytes(ply_bytes(body, color).replace(
                 b'coordinates native_depth_camera', b'coordinates ground_body', 1))
-            m = r.get('measurement', {})
-            valid = m.get('reference_id') == alignment['reference_id'] and m.get('cleaning_digest') == mask_digest(removed)
-            rows, summary = measure_slices(body['xyz_mm'], alignment['frame']['neck_tail_horizontal_span_mm'],
-                m.get('thickness_mm', 15), m.get('min_points', 20), m.get('slice_reviews') if valid else {})
-            summary.update(measurement_ready=all(row['status'] == 'usable' for row in rows),
-                notes=m.get('notes', ''), reference_id=alignment['reference_id'])
-            with (dest/'slice_measurements.csv').open('w', encoding='utf-8-sig', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-                writer.writeheader()
-                writer.writerows(rows)
         else:
             for name in ('cleaned_body_points.npz', 'cloud_cleaned_body_mm.ply', 'slice_measurements.csv'):
                 if (dest/name).exists():
@@ -792,8 +900,8 @@ class ProcessingService:
             original_valid_depth_ratio=result['report']['stats']['valid_depth_ratio'],
             removed_fraction_of_original_points=float(removed.mean()),
             cleaning_revision=r['revision'], input_points_sha256=r['input_points_sha256'])
-        write_json(dest/'measurement_summary.json', summary)
-        features = self.export_features_to(dest, result)
+        if include_measurement:
+            write_json(dest/'measurement_summary.json', summary)
         # Exported previews are standalone and read-only; all measurements were
         # calculated on full-density points before this display-only sample.
         preview = body if alignment else cleaned
@@ -801,7 +909,7 @@ class ProcessingService:
         data = {'xyz': preview['xyz_mm'][sample].round(3).tolist(), 'rgb': color[sample].tolist(),
             'indices': ids[sample].tolist(), 'removed': [0]*len(sample), 'selected': [0]*len(sample),
             'total': len(removed), 'kept_count': len(ids), 'removed_count': int(removed.sum()),
-            'alignment': alignment, 'offline': True, 'offline_body': bool(alignment), 'summary': summary, 'rows': rows,
+            'alignment': alignment, 'offline': True, 'offline_body': bool(alignment), 'summary': summary,
             'features': features}
         html = (PAGES_DIR/'processing.html').read_text(encoding='utf-8')
         script = (JS_DIR/'processing.js').read_text(encoding='utf-8')
