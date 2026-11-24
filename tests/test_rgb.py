@@ -1,7 +1,9 @@
+import io
 from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pointcloud_workbench.core import (np, Image, read_json, write_json, sha256, reconstruct,
                                        export_frame, display_ir)
@@ -143,6 +145,26 @@ class RGBCloudTest(unittest.TestCase):
             self.assertTrue(np.isnan(saved['infrared_raw']).all())
         np.testing.assert_array_equal(display_ir(payload['infrared_raw']),np.tile([110,120,140],(34,1)))
         self.assertEqual(before,{p.name:sha256(p) for p in self.source.iterdir()})
+
+    def test_processing_rgb_backdrop_works_without_segmentation_app_and_validates_sources(self):
+        payload, report, mask = reconstruct(self.source, self.seg, True)
+        target = self.root/'processing-result'
+        folder = export_frame(target/'pig_rgb'/'capture', payload, report, mask)
+        write_viewer(folder/'preview.html', payload, report)
+        workspace = Workspace(self.root/'processing-state')
+        state = workspace.open_results(str(target))
+        request = {'dataset_id': state['dataset_id'], 'id': state['frames'][0]['id']}
+        context = workspace.processing.context(request)
+        request['context_id'] = context['context_id']
+        with patch.dict('sys.modules', {'segmentation_workbench': None,
+                                       'segmentation_workbench.geometry': None}):
+            data = workspace.processing.image(request)
+        with Image.open(io.BytesIO(data)) as image:
+            self.assertEqual(image.size, (7, 5))
+            self.assertEqual(image.format, 'PNG')
+        Image.new('RGB', (9, 7), (0, 0, 0)).save(self.source/'color.png')
+        with self.assertRaisesRegex(ValueError, '原始 RGB／标定／深度已变化'):
+            workspace.processing.image(request)
 
     def test_workspace_generates_rgb_without_requiring_infrared_files(self):
         source=self.root/'dataset'; seg=self.root/'segmentation'

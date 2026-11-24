@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>点云清理</title><link rel="stylesheet" href="/processing.css"></head>
+<body>
+<div class="tools" role="toolbar" aria-label="点云视图">
+  <select id="coordinate" aria-label="点云坐标系"><option value="camera">相机坐标</option><option value="body">猪体坐标</option></select>
+  <button data-view="top">正视</button><button data-view="side">侧视</button><button data-view="rear">另一侧</button><button data-view="oblique">斜视</button>
+  <select id="fit" aria-label="取景范围"><option value="body">主体视野</option><option value="full">全部点</option><option value="selected">选中点</option></select>
+  <button id="resetView">重置视角</button><button id="sourceImage">原图定位</button><button id="reloadData">重新载入</button>
+  <button id="togglePanel" aria-expanded="true" aria-controls="processingPanel">隐藏工具</button>
+</div>
+<main>
+  <div class="view"><canvas id="cloud" aria-label="可旋转的点云及疑似飞点"></canvas>
+    <div class="viewbadge" id="viewBadge">正在载入…</div>
+    <div class="hint" id="viewHint">拖动旋转 · 滚轮缩放 · Shift 拖动平移 · 双击重置</div>
+  </div>
+  <aside id="processingPanel">
+    <section class="summary"><h2 id="summaryTitle">点云查看与清理</h2><div id="counts"></div><p id="alignmentHint" class="muted"></p><p id="originalQuality" class="muted"></p></section>
+    <details id="cleaningSection" open><summary>保守清理</summary><div class="sectionbody cleaning-layout">
+      <div class="cleaning-detection-row">
+      <label>检测方式<select id="method"><option value="far">远离主体的点</option><option value="neighbor">邻域稀疏的点</option><option value="both">合并两类候选</option></select></label>
+      <button id="detect" class="primary">检测并高亮候选</button>
+      </div>
+      <div class="cleaning-parameters">
+      <label>主体外扩 / mm<input id="margin" type="number" min="50" max="2000" step="50" value="300"></label><label>邻域下限 / mm<input id="neighborDistance" type="number" min="5" max="500" value="50"></label>
+      <label id="neighborLabel">邻居数量<input id="neighbors" type="number" min="3" max="64" value="8"></label>
+      </div>
+      <p class="muted cleaning-detection-hint">红色仅为候选；轮廓和端点请结合原图检查。</p>
+      <div class="cleaning-selection-tools">
+      <button id="boxRemove" aria-pressed="false">框选删除</button><button id="boxRestore" aria-pressed="false">框选恢复</button>
+      <label class="check"><input id="showRemoved" type="checkbox">显示已删除点（灰色）</label>
+      </div>
+      <p id="selectionNotice" class="notice" hidden>连续框选累加，贯穿所有深度。Alt 拖动旋转核对，确认后可继续；Esc 退出。</p>
+      <div id="candidateInfo" class="candidate">尚未选择点</div>
+      <div class="twocol"><button id="applySelection" class="danger" disabled>确认删除选中点</button><button id="clearSelection" disabled>取消选点</button></div>
+      <div class="history"><button id="undo" disabled>撤销</button><button id="redo" disabled>重做</button><button id="restoreAll" disabled>恢复全部</button></div>
+      <p class="muted cleaning-save-hint">确认后自动暂存，原始点云保留；在顶部“导出点云成果”保存成果。</p>
+    </div></details>
+    <details id="geometrySection"><summary>几何特征与剖面序列</summary><div class="sectionbody">
+      <p id="geometryLock" class="notice">完成坐标对齐后即可计算。</p>
+      <div id="geometryControls" hidden>
+        <div class="geometry-setup">
+          <div class="geometry-parameters">
+            <label>剖面数量 K<select id="profileCount"><option>16</option><option selected>32</option><option>64</option></select></label>
+            <label>薄带 / mm<input id="profileThickness" type="number" min="5" max="100" value="20"></label>
+            <label>最少点数<input id="profileMinimum" type="number" min="3" max="500" value="20"></label>
+            <label>网格 / mm<input id="profileGrid" type="number" min="2" max="50" value="10"></label>
+            <button id="computeGeometry" class="primary">计算并保存参数</button>
+          </div>
+          <p id="geometryWarnings" class="notice"></p>
+        </div>
+        <div class="geometry-inspection">
+          <div class="geometry-sequence">
+            <label class="trend-select">序列曲线<select id="trendChannel"><option value="width_q02_q98_mm">可见宽度 / mm</option><option value="visible_transverse_arc_mm">可见横剖面弧长 / mm</option><option value="relative_height_p95_mm">相对高度 / mm</option><option value="height_p95_mm">距地面高度 / mm</option><option value="height_gradient">高度梯度 / mm/mm</option><option value="transverse_curvature_per_mm">横剖面拟合曲率 / mm⁻¹</option><option value="bulge_mm">凸起量 / mm</option><option value="point_count">点数</option><option value="transverse_bin_coverage">横向网格覆盖率 / 0–1</option><option value="fit_rmse_mm">拟合误差 RMSE / mm</option></select></label>
+            <canvas id="profileTrend" class="profileplot" aria-label="沿中心线的剖面特征序列，点击查看剖面，拖动选择批量范围"></canvas>
+            <div class="slicenav"><button id="prevProfile" aria-label="上一局部剖面">‹</button><input id="profileSlider" type="range" min="0" max="31" value="0" aria-label="局部剖面位置"><button id="nextProfile" aria-label="下一局部剖面">›</button></div>
+          </div>
+          <div class="geometry-profile">
+            <p id="profileInfo"></p><canvas id="profilePlot" class="profileplot" aria-label="局部法向剖面预览"></canvas>
+            <div class="reviewbuttons"><button id="profileUsable">边界完整·可测</button><button id="profileUnusable">缺失·不可测</button><button id="profilePending">待定</button></div>
+          </div>
+        </div>
+        <div class="profile-batch" role="group" aria-label="按剖面范围批量复核">
+          <strong>批量复核</strong>
+          <label>起始剖面<input id="profileRangeStart" type="number" min="1" max="32" value="1" step="1"></label>
+          <span aria-hidden="true">至</span>
+          <label>结束剖面<input id="profileRangeEnd" type="number" min="1" max="32" value="32" step="1"></label>
+          <button id="selectAllProfiles">全部剖面</button>
+          <div class="profile-batch-actions">
+            <button id="batchProfileUsable" class="primary">确认所选</button>
+            <button id="batchProfileUnusable" class="danger">淘汰所选</button>
+            <button id="batchProfilePending">恢复待定</button>
+          </div>
+          <p id="profileRangeHint" class="muted" aria-live="polite"></p>
+        </div>
+        <section class="geometry-results" aria-labelledby="geometryResultsTitle">
+          <div class="geometry-results-heading"><h3 id="geometryResultsTitle">整体几何特征</h3><span id="geometryExportHint">与剖面序列一起随顶部“导出点云成果”保存</span></div>
+          <div id="geometrySummary" aria-label="整体几何特征"></div>
+        </section>
+        <details class="geometry-help"><summary>测量说明与导出</summary>
+          <p class="muted">使用当前保留的完整点云，沿平滑可见中心线的局部法向切片。适用于 X 方向单调的站立姿态，明显折弯请标记不可测。</p>
+          <p class="muted">端点和地面默认沿用已确认的坐标对齐；采集不适用时直接标记测量筛选“淘汰”。可在曲线上拖选或输入起止编号，一次确认、淘汰或恢复待定；“全部剖面”选择整条序列。点数不足的剖面不能确认为可测，批量确认时会跳过并提示。改参数、清理或坐标变化后需重新确认。</p>
+          <p class="muted">可见横剖面弧长沿横向分箱中位数折线累计，缺箱、稀疏箱或明显高度跳变时留空，不跨缺口连接，不是完整围度。</p>
+          <p class="muted">顶部导出勾选“测量复核”后，已保存参数或复核记录的采集会一起导出整体几何 JSON、批量几何 CSV 和剖面序列 CSV/NPZ。序列包含全部 10 个通道及有效性、可用性、复核标记；积分是可见高度代理，此处不输出真实体积、胸围或预测体重。</p>
+        </details>
+      </div>
+    </div></details>
+    <div id="offlineFiles" hidden><a href="cleaned_points.npz">清理后相机坐标 NPZ</a><br><a href="measurement_summary.json">测量汇总</a> · <a href="pointcloud_cleaning.json">清理记录</a><br><a id="bodyFile" href="cleaned_body_points.npz">清理后猪体坐标 NPZ</a> · <span id="sequenceFiles"><a href="geometry_features.json">几何特征</a> · <a href="profile_sequence.csv">剖面序列表</a> · <a href="profile_sequence.npz">剖面序列 NPZ</a></span></div>
+  </aside>
+</main>
+<div id="message" role="status" aria-live="polite"></div>
+<dialog id="imageDialog"><div class="dialoghead"><h2>分割底图上的位置</h2><button id="closeImage" aria-label="关闭原图定位">×</button></div><p id="imageHint"></p><div class="imagewrap"><canvas id="imageCanvas"></canvas></div></dialog>
+<script>const APP_TOKEN='__TOKEN__';</script><script src="/processing.js"></script>
+</body></html>

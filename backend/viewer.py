@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 from .core import display_ir, export_metadata
+from .paths import TEMPLATES_DIR
 
 
 def view_bounds(xyz):
@@ -34,7 +35,7 @@ def render_viewer(payload, report, embedded=False):
             'rgb': rgb[idx].tolist(), 'ir': display_ir(payload['infrared_raw'])[idx].tolist(),
             'valid': payload['rgb_valid'][idx].astype(int).tolist(), 'report': report,
             'view_bounds': view_bounds(payload['xyz_mm'])}
-    template = Path(__file__).with_name('viewer.html').read_text(encoding='utf-8')
+    template = (TEMPLATES_DIR/'viewer.html').read_text(encoding='utf-8')
     encoded = json.dumps(data, ensure_ascii=False, separators=(',', ':'), allow_nan=False).replace('<', '\\u003c')
     registration_image = report.get('rgb_registration', {}).get('check_image') == 'rgb_registration_check.png'
     return (template.replace('__POINT_DATA__', encoded)

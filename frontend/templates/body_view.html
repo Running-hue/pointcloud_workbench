@@ -6,7 +6,8 @@
 'use strict';
 const DATA=__DATA__, r=DATA.record, $=id=>document.getElementById(id), canvas=$('cloud'),ctx=canvas.getContext('2d');
 $('status').textContent=r.confirmed?'坐标已确认':'待核对的对齐预览';
-$('count').textContent=`完整点云 ${DATA.count.toLocaleString()} 点；显示 ${DATA.xyz.length.toLocaleString()} 点`;
+$('count').textContent=`${r.display_filtered?'清理后点云':'完整点云'} ${DATA.count.toLocaleString()} 点；显示 ${DATA.xyz.length.toLocaleString()} 点`;
+if(r.display_filtered){$('status').textContent+=' · 清理版本';const links=$('files').querySelectorAll('a');links[0].textContent='原始猪体坐标 PLY';links[1].textContent='原始 NPZ';}
 $('quality').textContent=`地面内点 ${(r.ground_quality.inlier_ratio*100).toFixed(1)}% · 拟合残差 RMS ${r.ground_quality.inlier_rmse_mm.toFixed(2)} mm（不代表实际测量精度）`;
 $('warnings').textContent=r.warnings.join(' ');$('reference').textContent='坐标参考 '+r.reference_id;$('files').hidden=!r.confirmed;
 let yaw=-.35,pitch=.6,zoom=1,drag=null;

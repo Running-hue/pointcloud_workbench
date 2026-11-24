@@ -18,6 +18,8 @@ from .core import (np, cv2, Image, backproject, project, sha256, read_json,
                    write_json, independent_paths, within, display_ir, verify_ir_depth,
                    camera_identity, input_mode, sample_rgb)
 from .registration import rgb_timing, depth_to_color
+from .paths import TEMPLATES_DIR
+from .workflow import workflow_state
 
 VERSION = 'ground-body-mm-v1'
 SIDE_FILES = {'alignment.json', 'body_points.npz', 'cloud_body_mm.ply',
@@ -227,7 +229,7 @@ def render_body_view(payload, record):
         rgb[~good] = [110, 120, 140]
     data = {'xyz': points[idx].round(3).tolist(), 'rgb': rgb.tolist(),
             'record': record, 'count': len(points)}
-    template = Path(__file__).with_name('body_view.html').read_text(encoding='utf-8')
+    template = (TEMPLATES_DIR/'body_view.html').read_text(encoding='utf-8')
     return template.replace('__DATA__', json.dumps(data, ensure_ascii=False, allow_nan=False).replace('<', '\\u003c'))
 
 
@@ -244,6 +246,9 @@ class AlignmentService:
         result = self.ws.results.get(row['relative_dir'])
         if not result:
             raise ValueError('请先生成或打开当前采集的点云')
+        if (result.get('cloud_review', {}).get('stages') is not None
+                and workflow_state(result)['alignment']['blocked_by']):
+            raise ValueError('点云清理已淘汰，本采集不再进入坐标对齐；可返回清理阶段修改结论')
         return row, result
 
     def _raw(self, payload, row, report):
@@ -279,6 +284,7 @@ class AlignmentService:
                 cloud = {k: f[k] for k in f.files}
             if not len(cloud['xyz_mm']) or not np.isfinite(cloud['xyz_mm']).all():
                 raise ValueError('当前点云为空或含无效坐标')
+            working_keep = self.ws.processing.keep_mask(result)
             uv = project(cloud['xyz_mm'], stream['profile'])
             h, w = codes.shape
             keep = np.isfinite(uv).all(axis=1) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
@@ -344,6 +350,8 @@ class AlignmentService:
                        source_root=capture_root(source, row['relative_dir']),
                        source_key=source_key, reference=reference, xyz=xyz, valid=valid, fg=fg,
                        profile=stream['profile'], base=backgrounds[default_mode], cloud=cloud,
+                       working_keep=working_keep,
+                       cleaning_digest=result.get('processing', {}).get('record', {}).get('cleaning_digest', ''),
                        backgrounds=backgrounds, default_display_mode=default_mode,
                        input_cloud_sha256=sha256(result['folder']/'points.npz'),
                        input_report_sha256=sha256(result['folder']/'pointcloud.json'))
@@ -357,6 +365,7 @@ class AlignmentService:
                     'draft_binding': digest_json({'raw': hashes, 'cloud': ctx['input_cloud_sha256'], 'report': ctx['input_report_sha256']}),
                     'relative_dir': row['relative_dir'], 'pig_id': row['pig_id'],
                     'capture_id': row['capture_id'],
+                    'cleaning_removed_count': int((~working_keep).sum()),
                     'camera': report.get('camera', {}), 'input_mode': report.get('input_mode', 'infrared'),
                     'reviewed': report.get('reviewed', False), 'reference': reference,
                     'saved_alignment': read_json(result['folder']/'alignment.json') if result.get('has_alignment') else None,
@@ -382,6 +391,9 @@ class AlignmentService:
         if (sha256(ctx['folder']/'points.npz') != ctx['input_cloud_sha256']
                 or sha256(ctx['folder']/'pointcloud.json') != ctx['input_report_sha256']):
             raise ValueError('当前点云已变化，请重新打开坐标对齐')
+        result = self.ws.results[ctx['row']['relative_dir']]
+        if result.get('processing', {}).get('record', {}).get('cleaning_digest', '') != ctx.get('cleaning_digest', ''):
+            raise ValueError('点云清理版本已变化，请重新载入坐标对齐场景')
         return ctx
 
     def _anchor(self, ctx, value, label):
@@ -395,7 +407,7 @@ class AlignmentService:
             raise ValueError(f'{label}没有有效深度，请在同一部位重新选点')
         if not ctx['fg'][v, u]:
             raise ValueError(f'{label}不在当前点云可见范围，请核对分割或重新选点')
-        distance = np.linalg.norm(ctx['cloud']['xyz_mm']-ctx['xyz'][v, u], axis=1).min()
+        distance = np.linalg.norm(ctx['cloud']['xyz_mm'][ctx['working_keep']]-ctx['xyz'][v, u], axis=1).min()
         if distance > 35:
             raise ValueError(f'{label}深度与当前猪体点云相距超过 35 mm，请避开轮廓边缘、地面和遮挡物')
         return {'pixel_uv_native': a.tolist(), 'sample_pixel_uv_native': [int(u), int(v)],
@@ -430,7 +442,7 @@ class AlignmentService:
             warnings = []
             if not ctx['report'].get('reviewed'):
                 warnings.append('分割仍为初稿；坐标确认不会把分割改为已确认，后续体尺仍需复核躯干边界。')
-            below = float((body[:, 2] < -20).mean())
+            below = float((body[ctx['working_keep'], 2] < -20).mean())
             if below > .02:
                 warnings.append(f'{below:.1%} 的点低于地面 20 mm，请检查地面拟合和分割背景。')
             display_mode = payload.get('display_mode', ctx['default_display_mode'])
@@ -494,18 +506,21 @@ class AlignmentService:
             candidate = ctx.get('candidate')
             if not candidate or candidate['id'] != payload.get('candidate_id'):
                 raise ValueError('请先重新计算坐标对齐')
-            return render_body_view({**ctx['cloud'], 'xyz_mm': candidate['body']}, candidate['record'])
+            keep = ctx['working_keep']
+            filtered = {k: v[keep] for k, v in ctx['cloud'].items()}
+            record = {**candidate['record'], 'display_filtered': bool((~keep).any())}
+            return render_body_view({**filtered, 'xyz_mm': candidate['body'][keep]}, record)
 
     def save(self, payload):
         return self._save(payload, cached=False)
 
     def confirm(self, payload):
-        """Confirm alignment and keep its cloud together until a batch export."""
+        """Persist the coordinate reference; capture screening remains explicit."""
         return self._save(payload, cached=True)
 
     def _save(self, payload, cached):
         from .workspace import (directory, folder_name, safe_copy_tree, atomic_json,
-                                write_cloud_review, cloud_review_record)
+                                write_cloud_review, cloud_review_state, write_current_cloud)
         with self.ws.lock:
             ctx = self._context(payload)
             candidate = ctx.get('candidate')
@@ -514,12 +529,11 @@ class AlignmentService:
             legacy_confirmed = payload.get('floor_confirmed') is True and payload.get('anchors_confirmed') is True
             if cached:
                 if payload.get('alignment_confirmed') is not True and not legacy_confirmed:
-                    raise ValueError('请检查地面、端点与坐标方向，再点击“确认对齐并保留”')
+                    raise ValueError('请检查地面、端点与坐标方向，再点击“确认坐标对齐”')
             elif not legacy_confirmed:
                 raise ValueError('请核对地面平面与颈根、尾根，再勾选两项确认')
             relative_dir = ctx['row']['relative_dir']
             result = self.ws.results[relative_dir]
-            review = cloud_review_record(result, relative_dir, 'keep') if cached else result.get('cloud_review')
             if cached:
                 parent = self.ws.state_dir/'alignment_cache'
                 if parent.is_symlink():
@@ -547,7 +561,6 @@ class AlignmentService:
                 dest = within(stage, ctx['row']['relative_dir'])
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 safe_copy_tree(ctx['folder'], dest)
-                write_cloud_review(dest, {**result, 'cloud_review': review})
                 # The copy may contain an older aligned view. Replace sidecars only in this new export.
                 body_payload = {**ctx['cloud'], 'xyz_mm': candidate['body'],
                                 'source_point_index': np.arange(len(candidate['body']), dtype=np.int64)}
@@ -564,12 +577,19 @@ class AlignmentService:
                           'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
                 (dest/'cloud_body_mm.ply').write_bytes(header.encode()+rows.tobytes())
                 write_json(dest/'alignment.json', record)
+                aligned_result = {**result, 'folder': dest, 'has_alignment': True,
+                                  'alignment_reference_id': record['reference_id']}
+                write_cloud_review(dest, aligned_result)
+                decision = cloud_review_state(aligned_result)['cloud_decision']
                 (dest/'alignment_check.png').write_bytes(candidate['check'])
                 (dest/'body_preview.html').write_text(render_body_view(body_payload, record), encoding='utf-8')
-                write_json(stage/'pointcloud_dataset.json', {'schema_version': 1, 'coordinate_system': 'native_depth_camera',
-                    'unit': 'mm', 'aligned_coordinate_system': 'ground_body',
-                    'frames': [{**ctx['row'], 'has_alignment': True, 'alignment_reference_id': record['reference_id'],
-                                'cloud_decision': review['decision'] if review else 'pending'}]})
+                self.ws.processing.export_to(dest, result)
+                current = write_current_cloud(dest, aligned_result, decision)
+                write_json(stage/'pointcloud_dataset.json', {'schema_version': 1, 'coordinate_system': 'ground_body',
+                    'unit': 'mm', 'original_coordinate_system': 'native_depth_camera',
+                    'frames': [{**ctx['row'], **current, 'primary_ply': current['current_ply'],
+                                'primary_npz': current['current_npz'], 'has_alignment': True, 'alignment_reference_id': record['reference_id'],
+                                'cloud_decision': decision}]})
                 rel = quote(ctx['row']['relative_dir'], safe='/')
                 (stage/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>坐标对齐成果</title>'
                     '<style>body{font:16px system-ui;margin:40px;line-height:2}a{color:#247767}</style>'
@@ -593,9 +613,6 @@ class AlignmentService:
             previous_result = self.ws.results[ctx['row']['relative_dir']]
             if attached:
                 self.ws.attach_alignment(ctx, target, cached=cached)
-            if cached:
-                self.ws.settings.setdefault('cloud_reviews', {}).setdefault(str(self.ws.results_root), {})[relative_dir] = review
-                self.ws.results[relative_dir]['cloud_review'] = review
             try:
                 self.ws.remember()
             except OSError:
@@ -613,4 +630,4 @@ class AlignmentService:
                 warning += ' 成果已保存，但未能缓存同次采集坐标参考；可从 alignment.json 恢复。'
             return {'output': str(target), 'relative_dir': ctx['row']['relative_dir'],
                     'reference_id': record['reference_id'], 'warning': warning, 'attached': attached, 'cached': cached,
-                    'cloud_decision': review['decision'] if review else 'pending'}
+                    'cloud_decision': decision}
