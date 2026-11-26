@@ -222,7 +222,8 @@ class ProcessingService:
                             with np.load(result['folder']/'points.npz', allow_pickle=False) as cloud:
                                 body = transform_points(cloud['xyz_mm'][~removed], alignment['frame'])
                             features = feature_math.calculate(body, alignment['frame']['neck_tail_horizontal_span_mm'],
-                                m.get('feature_settings'), REFERENCE_CONDITIONS, m.get('feature_reviews'))
+                                m.get('feature_settings'), REFERENCE_CONDITIONS, m.get('feature_reviews'),
+                                centerline_version=feature_math.centerline_version(m))
                             record['measurement'] = {**m, 'review_summary': profile_review_summary(features)}
                         else:
                             record['measurement'] = {k: v for k, v in m.items() if k != 'review_summary'}
@@ -303,26 +304,7 @@ class ProcessingService:
     def context(self, payload):
         with self.ws.lock:
             row, result = self._result(payload)
-            points_hash = sha256(result['folder']/'points.npz')
-            report_hash = sha256(result['folder']/'pointcloud.json')
-            with np.load(result['folder']/'points.npz', allow_pickle=False) as saved:
-                cloud = {k: saved[k].copy() for k in saved.files}
-            p = cloud['xyz_mm']
-            if p.ndim != 2 or p.shape[1] != 3 or not len(p) or not np.isfinite(p).all():
-                raise ValueError('点云坐标无效')
-            n = len(p)
-            if n != result['report']['stats']['points']:
-                raise ValueError('原点云点数与生成记录不一致，请重新核对成果')
-            if any(value.ndim == 0 or len(value) != n for value in cloud.values()):
-                raise ValueError('逐点属性长度不一致，无法安全清理')
-            ctx = {'id': secrets.token_hex(16), 'row': row, 'cloud': cloud,
-                'report': result['report'], 'points_hash': points_hash, 'report_hash': report_hash,
-                'removed': np.zeros(n, bool), 'history': [], 'cursor': 0, 'revision': '',
-                'measurement': {}, 'candidate': None,
-                'alignment': read_json(result['folder']/'alignment.json') if alignment_status(result['folder']) else None}
-            if result.get('processing'):
-                r, ctx['removed'], ctx['history'] = self._read(result['processing']['folder'], result)
-                ctx.update(cursor=r['history_cursor'], revision=r['revision'], measurement=r.get('measurement', {}))
+            ctx = self._load_context(row, result)
             # Cache only a few full-density captures; all edits are durable.
             self.contexts.pop(row['relative_dir'], None)
             while len(self.contexts) >= 3:
@@ -330,12 +312,37 @@ class ProcessingService:
             self.contexts[row['relative_dir']] = ctx
             return self._response(ctx)
 
+    def _load_context(self, row, result):
+        """Load durable inputs without replacing an open editor's context."""
+        points_hash = sha256(result['folder']/'points.npz')
+        report_hash = sha256(result['folder']/'pointcloud.json')
+        with np.load(result['folder']/'points.npz', allow_pickle=False) as saved:
+            cloud = {k: saved[k].copy() for k in saved.files}
+        p = cloud['xyz_mm']
+        if p.ndim != 2 or p.shape[1] != 3 or not len(p) or not np.isfinite(p).all():
+            raise ValueError('点云坐标无效')
+        n = len(p)
+        if n != result['report']['stats']['points']:
+            raise ValueError('原点云点数与生成记录不一致，请重新核对成果')
+        if any(value.ndim == 0 or len(value) != n for value in cloud.values()):
+            raise ValueError('逐点属性长度不一致，无法安全清理')
+        ctx = {'id': secrets.token_hex(16), 'row': row, 'cloud': cloud,
+            'report': result['report'], 'points_hash': points_hash, 'report_hash': report_hash,
+            'removed': np.zeros(n, bool), 'history': [], 'cursor': 0, 'revision': '',
+            'measurement': {}, 'candidate': None, 'alignment_revision': result.get('alignment_revision', ''),
+            'alignment': read_json(result['folder']/'alignment.json') if alignment_status(result['folder']) else None}
+        if result.get('processing'):
+            r, ctx['removed'], ctx['history'] = self._read(result['processing']['folder'], result)
+            ctx.update(cursor=r['history_cursor'], revision=r['revision'], measurement=r.get('measurement', {}))
+        return ctx
+
     def _measurement(self, ctx):
         saved = ctx['measurement']
         reference = ctx['alignment']['reference_id'] if ctx['alignment'] else None
         valid = saved.get('reference_id') == reference and saved.get('cleaning_digest') == mask_digest(ctx['removed'])
         return {**saved, 'slice_reviews': saved.get('slice_reviews', {}) if valid else {},
                 'feature_reviews': saved.get('feature_reviews', {}) if valid else {},
+                'centerline_version': feature_math.centerline_version(saved) if valid else feature_math.CENTERLINE_VERSION,
                 'feature_quality': dict(REFERENCE_CONDITIONS),
                 'reference_id': reference, 'cleaning_digest': mask_digest(ctx['removed'])}
 
@@ -366,6 +373,7 @@ class ProcessingService:
         points = cloud['xyz_mm'][sample]
         measurement = self._measurement(ctx)
         return {'context_id': ctx['id'], 'revision': ctx['revision'],
+            'alignment_revision': ctx['alignment_revision'],
             'total': n, 'removed_count': int(ctx['removed'].sum()), 'kept_count': int((~ctx['removed']).sum()),
             'can_undo': ctx['cursor'] > 0, 'can_redo': ctx['cursor'] < len(ctx['history']),
             'candidate_count': len(selected), 'candidate_action': ctx['candidate']['action'] if ctx['candidate'] else None,
@@ -426,8 +434,8 @@ class ProcessingService:
             ctx['candidate'] = None
             return self._response(ctx)
 
-    def _persist(self, ctx, result):
-        from .workspace import atomic_json
+    def _persist(self, ctx, result, *, finalize_review=False):
+        from .workspace import atomic_json, cloud_review_record
         parent = self.ws.state_dir/'processing_cache'
         if parent.is_symlink():
             raise ValueError('清理暂存目录不能使用符号链接')
@@ -455,9 +463,18 @@ class ProcessingService:
             stage.rename(target)
             settings = copy.deepcopy(self.ws.settings)
             settings.setdefault('point_processing', {}).setdefault(str(self.ws.results_root), {})[ctx['row']['relative_dir']] = str(target)
+            processing = {'folder': target, 'record': record}
+            if finalize_review:
+                # Bind the stage keep to the final profile labels and publish
+                # both links in one atomic settings replacement.
+                review = cloud_review_record({**result, 'processing': processing},
+                    ctx['row']['relative_dir'], 'keep', 'review')
+                settings.setdefault('cloud_reviews', {}).setdefault(str(self.ws.results_root), {})[ctx['row']['relative_dir']] = review
             atomic_json(self.ws.state_dir/'settings.json', settings)
             self.ws.settings = settings
-            result['processing'] = {'folder': target, 'record': record}
+            result['processing'] = processing
+            if finalize_review:
+                result['cloud_review'] = review
             ctx['revision'] = revision
         except Exception:
             shutil.rmtree(stage, ignore_errors=True)
@@ -548,6 +565,28 @@ class ProcessingService:
                 and workflow_state(result)['review']['blocked_by']):
             raise ValueError('前序阶段已淘汰，本采集不再进入测量复核；可返回前序阶段修改结论')
 
+    def finalize_review(self, row, result):
+        """Commit remaining pending profiles as unusable with the stage keep.
+
+        Called under the workspace lock after dataset/stage/version checks.
+        Work on a detached context so a failed save leaves open editors intact.
+        """
+        self._require_review(result)
+        ctx = self._load_context(row, result)
+        computed = self._features(ctx)
+        pending = [r['index'] for r in computed['profiles'] if r['status'] == 'pending']
+        if not pending:
+            return 0
+        m = self._measurement(ctx)
+        m['measurement_started'] = True
+        m['feature_reviews'] = {**m.get('feature_reviews', {}), **{str(i): 'unusable' for i in pending}}
+        ctx['measurement'] = m
+        self._persist(ctx, result, finalize_review=True)
+        # In-flight requests from the previous revision must reload, rather
+        # than overwriting the finalized labels with an old editor response.
+        self.contexts.pop(row['relative_dir'], None)
+        return len(pending)
+
     def _features(self, ctx):
         if not ctx['alignment']:
             raise ValueError('请先确认地面、尾根与颈躯连接点，完成坐标对齐')
@@ -560,12 +599,13 @@ class ProcessingService:
             'original_valid_depth_ratio': ctx['report']['stats']['valid_depth_ratio'],
             'point_source': 'all retained immutable points; no preview sampling',
             'feature_version': feature_math.VERSION,
+            'centerline_version': m['centerline_version'],
             'reference_conditions_source': 'confirmed_alignment_default'}
         key = json.dumps([provenance, m.get('feature_settings'), m.get('feature_quality'), m.get('feature_reviews')], sort_keys=True)
         if ctx.get('feature_cache', {}).get('key') != key:
             result = feature_math.calculate(self._coordinates(ctx, True)[~ctx['removed']],
                 ctx['alignment']['frame']['neck_tail_horizontal_span_mm'], m.get('feature_settings'),
-                m.get('feature_quality'), m.get('feature_reviews'), provenance)
+                m.get('feature_quality'), m.get('feature_reviews'), provenance, m['centerline_version'])
             ctx['feature_cache'] = {'key': key, 'result': result}
         return ctx['feature_cache']['result']
 
@@ -574,6 +614,9 @@ class ProcessingService:
         with self.ws.lock:
             ctx, result = self._ctx(payload)
             self._require_review(result)
+            reference_id = ctx['alignment']['reference_id'] if ctx['alignment'] else None
+            if 'alignment_reference_id' in payload and payload['alignment_reference_id'] != reference_id:
+                raise ValueError('对齐坐标已更新，请点击“重新载入”再复核剖面')
             old = copy.deepcopy(ctx['measurement'])
             m = self._measurement(ctx)
             changed = any(k in payload for k in ('settings', 'conditions', 'status'))
@@ -584,8 +627,10 @@ class ProcessingService:
                     m['measurement_started'] = True
                 if 'settings' in payload:
                     config = feature_math.settings(payload['settings'])
-                    if config != feature_math.settings(m.get('feature_settings')):
+                    if (config != feature_math.settings(m.get('feature_settings'))
+                            or m['centerline_version'] != feature_math.CENTERLINE_VERSION):
                         m['feature_reviews'] = {}
+                    m['centerline_version'] = feature_math.CENTERLINE_VERSION
                     m['feature_settings'] = config
                 if 'conditions' in payload:
                     # Accept the historical request shape without reinstating
@@ -671,6 +716,7 @@ class ProcessingService:
         valid = m.get('reference_id') == alignment['reference_id'] and m.get('cleaning_digest') == digest
         ctx = {'alignment': alignment, 'cloud': {'xyz_mm': points}, 'removed': removed,
             'measurement': {**m, 'feature_reviews': m.get('feature_reviews', {}) if valid else {},
+                            'centerline_version': feature_math.centerline_version(m) if valid else feature_math.CENTERLINE_VERSION,
                             'feature_quality': m.get('feature_quality', {}) if valid else {},
                             'reference_id': alignment['reference_id'], 'cleaning_digest': digest},
             'row': {'relative_dir': result['report'].get('relative_dir', alignment.get('relative_dir', ''))},

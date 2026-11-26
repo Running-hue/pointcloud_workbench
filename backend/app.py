@@ -96,7 +96,7 @@ def make_handler(workspace, token):
                     with workspace.lock:
                         if q.get('dataset_id', [''])[0] != workspace.dataset_id:
                             raise ValueError('目录已切换，请重新选择采集')
-                        p = workspace.media(q['id'][0], q['file'][0])
+                        p = workspace.media(q['id'][0], q['file'][0], q.get('alignment_revision', [None])[0])
                         if p.name in {'preview.html', 'body_preview.html'}:
                             # Render old and new exports through the current viewer without changing saved files.
                             body = p.name == 'body_preview.html'

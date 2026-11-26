@@ -6,6 +6,7 @@
   <button data-view="top">正视</button><button data-view="side">侧视</button><button data-view="rear">另一侧</button><button data-view="oblique">斜视</button>
   <select id="fit" aria-label="取景范围"><option value="body">主体视野</option><option value="full">全部点</option><option value="selected">选中点</option></select>
   <button id="resetView">重置视角</button><button id="sourceImage">原图定位</button><button id="reloadData">重新载入</button>
+  <button id="alignmentMarks" hidden>对齐标注</button>
   <button id="togglePanel" aria-expanded="true" aria-controls="processingPanel">隐藏工具</button>
 </div>
 <main>
@@ -66,11 +67,12 @@
           <label>结束剖面<input id="profileRangeEnd" type="number" min="1" max="32" value="32" step="1"></label>
           <button id="selectAllProfiles">全部剖面</button>
           <div class="profile-batch-actions">
-            <button id="batchProfileUsable" class="primary">确认所选</button>
+            <button id="batchProfileUsable" class="primary" title="只将选区内可算的剖面确认为可测，其他剖面保持原状态">确认所选</button>
             <button id="batchProfileUnusable" class="danger">淘汰所选</button>
             <button id="batchProfilePending">恢复待定</button>
           </div>
           <p id="profileRangeHint" class="muted" aria-live="polite"></p>
+          <p id="profileFinalizationHint" class="muted">“确认所选”只确认选区；复核完成后点击顶部测量筛选“保留”，其余待定剖面自动淘汰，已有可测／不可测标记保留。</p>
         </div>
         <section class="geometry-results" aria-labelledby="geometryResultsTitle">
           <div class="geometry-results-heading"><h3 id="geometryResultsTitle">整体几何特征</h3><span id="geometryExportHint">与剖面序列一起随顶部“导出点云成果”保存</span></div>
@@ -78,7 +80,7 @@
         </section>
         <details class="geometry-help"><summary>测量说明与导出</summary>
           <p class="muted">使用当前保留的完整点云，沿平滑可见中心线的局部法向切片。适用于 X 方向单调的站立姿态，明显折弯请标记不可测。</p>
-          <p class="muted">端点和地面默认沿用已确认的坐标对齐；采集不适用时直接标记测量筛选“淘汰”。可在曲线上拖选或输入起止编号，一次确认、淘汰或恢复待定；“全部剖面”选择整条序列。点数不足的剖面不能确认为可测，批量确认时会跳过并提示。改参数、清理或坐标变化后需重新确认。</p>
+          <p class="muted">端点和地面默认沿用已确认的坐标对齐；采集不适用时直接标记测量筛选“淘汰”。可在曲线上拖选或输入起止编号，一次确认、淘汰或恢复待定；“全部剖面”选择整条序列。“确认所选”只确认当前选区；顶部测量筛选“保留”会将其余待定剖面自动淘汰，已有可测／不可测标记不变。点数不足的剖面不能确认为可测，批量确认时会跳过并提示。改参数、清理或坐标变化后需重新确认。</p>
           <p class="muted">可见横剖面弧长沿横向分箱中位数折线累计，缺箱、稀疏箱或明显高度跳变时留空，不跨缺口连接，不是完整围度。</p>
           <p class="muted">顶部导出勾选“测量复核”后，已保存参数或复核记录的采集会一起导出整体几何 JSON、批量几何 CSV 和剖面序列 CSV/NPZ。序列包含全部 10 个通道及有效性、可用性、复核标记；积分是可见高度代理，此处不输出真实体积、胸围或预测体重。</p>
         </details>
@@ -88,6 +90,6 @@
   </aside>
 </main>
 <div id="message" role="status" aria-live="polite"></div>
-<dialog id="imageDialog"><div class="dialoghead"><h2>分割底图上的位置</h2><button id="closeImage" aria-label="关闭原图定位">×</button></div><p id="imageHint"></p><div class="imagewrap"><canvas id="imageCanvas"></canvas></div></dialog>
+<dialog id="imageDialog"><div class="dialoghead"><h2 id="imageTitle">分割底图上的位置</h2><button id="closeImage" aria-label="关闭原图定位">×</button></div><p id="imageHint"></p><div class="imagewrap"><canvas id="imageCanvas"></canvas></div></dialog>
 <script>const APP_TOKEN='__TOKEN__';</script><script src="/processing.js"></script>
 </body></html>

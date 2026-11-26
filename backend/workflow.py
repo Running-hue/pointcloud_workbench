@@ -18,6 +18,10 @@ def stage_version(result, stage):
     if stage == 'review':
         m = record.get('measurement', {})
         values = {k: m.get(k) for k in ('feature_settings', 'feature_quality', 'feature_reviews')}
+        # Preserve old screening digests until their measurement is explicitly
+        # saved with a model version; model changes then invalidate the stage.
+        if 'centerline_version' in m:
+            values['centerline_version'] = m['centerline_version']
         version['measurement_digest'] = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
     return version
 

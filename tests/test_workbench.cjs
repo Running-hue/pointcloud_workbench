@@ -16,10 +16,11 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 
 async function setup(initial = dataset, {storage = new Map()} = {}) {
   const elements = new Map();
+  const scrollCalls = [];
   function element() {
     return {value:'', checked:false, disabled:false, hidden:false, textContent:'', children:[],
       classList:{toggle() {}, add() {}}, parentElement:{}, listeners:{},
-      append(...items) { this.children.push(...items); }, replaceChildren() { this.children=[]; },
+      append(...items) { this.children.push(...items); }, replaceChildren(...items) { this.children=[...items]; },
       contentWindow:{}, setAttribute(name, value) {this[name]=value;}, removeAttribute(name) {delete this[name];}, scrollIntoView() {}, focus() {},
       addEventListener(name, fn) { this.listeners[name] = fn; },
       showModal() { this.open=true; }, close() { this.open=false; this.listeners.close?.(); }};
@@ -39,7 +40,9 @@ async function setup(initial = dataset, {storage = new Map()} = {}) {
       listeners[name] = async event => { for (const handler of handlers[name]) await handler(event); };
     }},
     document:{getElementById:id=>elements.get(id), createElement:element,
-      querySelectorAll:()=>[], querySelector:selector=>selector.includes('scope') ? {value:'selected'} : null},
+      querySelectorAll:()=>[], querySelector:selector=>selector === '.frame.active'
+        ? {scrollIntoView:options=>scrollCalls.push(options)}
+        : selector.includes('scope') ? {value:'selected'} : null},
     fetch: async (url, options) => {
       const payload = options?.body ? JSON.parse(options.body) : undefined;
       requests.push({url,payload});
@@ -52,10 +55,12 @@ async function setup(initial = dataset, {storage = new Map()} = {}) {
   const notify = data => listeners.message({origin:'http://localhost',source:elements.get('alignmentEditor').contentWindow,
     data:{type:'pointcloud-alignment',dataset_id:'one',id:'1',...data}});
   const notifyProcessing = data => listeners.message({origin:'http://localhost',source:elements.get('processingEditor').contentWindow,
-    data:{type:'pointcloud-processing',dataset_id:'one',id:vm.runInContext('current',context),...data}});
+    data:{type:'pointcloud-processing',dataset_id:'one',id:vm.runInContext('current',context),
+      editor_instance:String(vm.runInContext('processingInstance',context)),...data}});
   // A real processing iframe sends this after its initial context has loaded.
   await notifyProcessing({action:'busy',busy:false});
-  return {elements, requests, sandbox, listeners, storage, notify, notifyProcessing, run:code=>vm.runInContext(code,context)};
+  return {elements, requests, sandbox, listeners, storage, scrollCalls, notify, notifyProcessing,
+    run:code=>vm.runInContext(code,context)};
 }
 
 test('reload with no selection offers reviewed captures and never includes drafts by default', async () => {
@@ -187,6 +192,8 @@ test('saving an inline alignment preserves its editor and capture list for batch
   const initial={...dataset,clouds:2,results:'/clouds',frames:[frame('1',{has_cloud:true,points:100}),frame('2',{has_cloud:true,points:100})]};
   const ui=await setup(initial);ui.elements.get('alignCurrent').onclick();
   await ui.notify({action:'busy',busy:false});
+  ui.elements.get('frames').scrollTop=222;
+  const scrollCount=ui.scrollCalls.length;
   const url=ui.elements.get('alignmentEditor').src;
   ui.sandbox.reply=async()=>({...initial,frames:[{...initial.frames[0],has_alignment:true,alignment_revision:'new'},initial.frames[1]]});
   await ui.notify({action:'saved',output:'/aligned'});
@@ -196,6 +203,8 @@ test('saving an inline alignment preserves its editor and capture list for batch
   assert.equal(ui.run('state.frames[0].alignment_revision'),'new');
   assert.equal(ui.run('workspaceView'),'alignment');
   assert.equal(ui.elements.has('nextAlignment'),false);
+  assert.equal(ui.elements.get('frames').scrollTop,222);
+  assert.equal(ui.scrollCalls.length,scrollCount);
   ui.run("selectCapture('2')");
   assert.equal(ui.run('current'),'2');
   assert.match(ui.elements.get('alignmentEditor').src,/id=2/);
@@ -216,6 +225,29 @@ test('review uses the confirmed reference and saving keeps the current editor co
   ui.run("state.frames[0].alignment_revision='second'; renderViewer();");
   assert.notEqual(ui.run('processingKey'),key);
   assert.equal(ui.run('processingBusy'),true);
+});
+
+test('reconfirmed coordinates reach review before navigation and survive a delayed old refresh', async () => {
+  const initial={...dataset,clouds:1,results:'/clouds',frames:[frame('1',{
+    has_cloud:true,points:100,has_alignment:true,alignment_revision:'first'})]};
+  const ui=await setup(initial);
+  ui.elements.get('reviewCurrent').onclick();
+  await ui.notifyProcessing({action:'busy',busy:false});
+  let finishOldRefresh;
+  ui.sandbox.reply=()=>new Promise(resolve=>{finishOldRefresh=resolve;});
+  const oldRefresh=ui.notifyProcessing({action:'saved'});
+  await settle();
+  ui.elements.get('alignCurrent').onclick();
+  await ui.notify({action:'busy',busy:true});
+  const reconfirmed={...initial,frames:[{...initial.frames[0],alignment_revision:'second'}]};
+  await ui.notify({action:'saved',workspace_state:reconfirmed,realigned:true});
+  assert.equal(ui.elements.get('reviewCurrent').disabled,true);
+  finishOldRefresh(initial);
+  await oldRefresh;
+  await ui.notify({action:'busy',busy:false});
+  ui.elements.get('reviewCurrent').onclick();
+  assert.equal(ui.run('workspaceView'),'review');
+  assert.match(ui.run('processingKey'),/second/);
 });
 
 test('review remains reachable before alignment and changing captures clears its old context', async () => {
@@ -307,11 +339,24 @@ test('camera and segmentation filters are independent and use recorded camera me
   assert.match(ui.elements.get('cameraFilter').children.find(c=>c.value==='itof').textContent,/2/);
   ui.elements.get('cameraFilter').value='itof';ui.elements.get('cameraFilter').onchange();
   assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['itof-rgb','itof-ir']);
+  assert.deepEqual(clone(ui.run('[...selected]')),['itof-rgb','itof-ir']);
   ui.elements.get('modeFilter').value='infrared';ui.elements.get('modeFilter').onchange();
   assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['itof-ir']);
+  assert.deepEqual(clone(ui.run('[...selected]')),['itof-ir']);
   assert.equal(ui.run('current'),'itof-ir');
   ui.elements.get('cameraFilter').value='stereo';ui.elements.get('modeFilter').value='rgb';ui.elements.get('cameraFilter').onchange();
   assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['stereo-rgb']);
+  assert.deepEqual(clone(ui.run('[...selected]')),['stereo-rgb']);
+  ui.elements.get('cameraFilter').value='all';ui.elements.get('modeFilter').value='all';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(clone(ui.run('[...selected]')),['itof-rgb','itof-ir','stereo-rgb','unknown']);
+  ui.elements.get('search').value='itof-rgb';ui.elements.get('search').listeners.input();
+  assert.deepEqual(clone(ui.run('[...selected]')),['itof-rgb']);
+  ui.elements.get('search').value='';ui.elements.get('search').listeners.input();
+  ui.elements.get('filter').value='completed';ui.elements.get('filter').listeners.input();
+  assert.deepEqual(clone(ui.run('[...selected]')),[]);
+  assert.equal(ui.elements.get('selectedCount').textContent,'已勾选 0');
+  ui.elements.get('filter').value='all';ui.elements.get('filter').listeners.input();
+  assert.deepEqual(clone(ui.run('[...selected]')),['itof-rgb','itof-ir','stereo-rgb','unknown']);
 });
 
 test('without explicit selection generation follows the visible camera and segmentation scope', async () => {
@@ -587,11 +632,14 @@ test('camera and segmentation filters combine and move preview to a matching cap
   assert.deepEqual(clone(ui.run('visibleRows().map(r=>r.id)')),['stereo-ir','stereo-rgb']);
   assert.equal(ui.run('current'),'stereo-ir');
   assert.match(ui.elements.get('currentTitle').textContent,/双目 · IR 分割/);
-  assert.equal(ui.run('selected.size'),4);
-  assert.match(ui.elements.get('selectedCount').textContent,/隐藏 2/);
+  assert.deepEqual(clone(ui.run('[...selected]')),['stereo-ir','stereo-rgb']);
+  assert.equal(ui.elements.get('selectedCount').textContent,'已勾选 2');
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['stereo-ir','stereo-rgb']);
   ui.elements.get('modeFilter').value='rgb';
   ui.elements.get('modeFilter').onchange();
   assert.equal(ui.run('current'),'stereo-rgb');
+  assert.deepEqual(clone(ui.run('[...selected]')),['stereo-rgb']);
+  assert.equal(ui.elements.get('selectedCount').textContent,'已勾选 1');
   assert.match(ui.elements.get('currentTitle').textContent,/双目 · RGB 分割/);
   const card=ui.elements.get('frames').children[0].children[1];
   assert.match(card.children[1].textContent,/双目 · RGB 分割/);
@@ -788,6 +836,27 @@ const stageStatuses = (extra = {}) => ({
   alignment:{decision:'pending',available:true,has_output:false,reviewed:false,version:{},blocked_by:''},
   review:{decision:'pending',available:false,has_output:false,reviewed:false,version:{},blocked_by:''}, ...extra});
 
+test('camera progress shows completed pigs and captures separately for each camera',async()=>{
+  const complete={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
+  const done=(id,pig,camera)=>frame(id,{pig_id:pig,has_cloud:true,has_alignment:true,camera:{type:camera},
+    workflow_stages:stageStatuses({alignment:{...complete},review:{...complete}})});
+  const pending=(id,pig,camera)=>frame(id,{pig_id:pig,has_cloud:true,camera:{type:camera},
+    workflow_stages:stageStatuses()});
+  const frames=[done('a1','A','itof'),done('a2','A','itof'),done('b1','B','itof'),pending('b2','B','itof'),
+    done('c1','C','stereo'),done('d1','D','stereo'),pending('d2','D','stereo')];
+  const ui=await setup({...dataset,frames,clouds:7,pigs:4});
+  const progressLines=()=>ui.elements.get('cameraProgressText').children.map(line=>line.textContent);
+  assert.deepEqual(progressLines(),['iToF：1 / 2 头，3/4 条','双目：1 / 2 头，2/3 条']);
+  assert.match(ui.elements.get('cameraProgressText').title,/同一耳标下全部对应采集.*采集完成数/);
+  ui.elements.get('cameraFilter').value='itof';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(progressLines(),['iToF：1 / 2 头，3/4 条']);
+  ui.elements.get('cameraFilter').value='stereo';ui.elements.get('cameraFilter').onchange();
+  assert.deepEqual(progressLines(),['双目：1 / 2 头，2/3 条']);
+  ui.elements.get('filter').value='completed';ui.elements.get('filter').listeners.input();
+  assert.deepEqual(progressLines(),['双目：1 / 2 头，2/3 条'],
+    'camera progress stays scoped to all captures rather than only the filtered rows');
+});
+
 test('export includes only completed stages and cleaning can be selected independently', async () => {
   const row=frame('1',{has_cloud:true,cloud_ply:'cloud_ir_mm.ply',workflow_stages:stageStatuses()});
   const ui=await setup({...dataset,frames:[row],clouds:1,results:'/clouds'});
@@ -892,7 +961,7 @@ test('five cumulative progress filters include later completions and stay indepe
   for (const id of ['cleaningFilter','alignmentFilter','reviewFilter']) assert.equal(ui.elements.has(id),false);
 });
 
-test('completion progress counts current explicit keeps and remains global under filtering', async () => {
+test('camera progress counts completed pigs and captures without changing under list filters', async () => {
   const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
   const done=id=>frame(id,{has_cloud:true,has_alignment:true,has_cleaning:false,measurement_ready:false,
     workflow_stages:{cleaning:{...keep},alignment:{...keep},review:{...keep}}});
@@ -907,18 +976,14 @@ test('completion progress counts current explicit keeps and remains global under
   frames.push(frame('legacy',{has_cloud:true,has_alignment:true,cloud_decision:'keep'}));
   const initial={...dataset,frames,clouds:8};
   const ui=await setup(initial);
-  assert.equal(ui.elements.get('collectionProgressText').textContent,'三阶段完成 1 / 9');
-  assert.equal(ui.elements.get('collectionProgress').value,1);
-  assert.equal(ui.elements.get('collectionProgress').max,9);
-  assert.equal(ui.elements.get('collectionPercent').textContent,'11%');
-  assert.equal(ui.elements.get('stageProgressText').textContent,'清理 6 · 对齐 5 · 复核 4');
+  const progress=()=>ui.elements.get('cameraProgressText').children[0].textContent;
+  assert.equal(progress(),'未识别相机：1 / 9 头，1/9 条');
   assert.match(ui.elements.get('datasetSummary').textContent,/已采集完毕 1 次/);
   const badge=ui.elements.get('frames').children[0].children[1].children[0].children[0];
   assert.equal(badge.textContent,'已采集完毕');
   ui.elements.get('filter').value='completed';ui.elements.get('filter').listeners.input();
   assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['done']);
-  assert.match(ui.elements.get('listFooter').textContent,/显示 1\/9 · 已完成 1/);
-  assert.equal(ui.elements.get('collectionProgressText').textContent,'三阶段完成 1 / 9');
+  assert.equal(progress(),'未识别相机：1 / 9 头，1/9 条');
   ui.elements.get('filter').value='cleaning';ui.elements.get('filter').listeners.input();
   assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['done','blocked','pending','rejected','unreviewed','no-output']);
   ui.elements.get('filter').value='alignment';ui.elements.get('filter').listeners.input();
@@ -926,20 +991,18 @@ test('completion progress counts current explicit keeps and remains global under
   ui.elements.get('filter').value='all';
   ui.elements.get('search').value='stale';ui.elements.get('search').listeners.input();
   assert.equal(ui.run('visibleRows().length'),1);
-  assert.match(ui.elements.get('listFooter').textContent,/已完成 0/);
+  assert.equal(progress(),'未识别相机：1 / 9 头，1/9 条');
   // An upstream edit invalidates completion immediately on the next state refresh.
   frames[0].workflow_stages.cleaning.stale=true;
   ui.run(`accept(${JSON.stringify(initial)})`);
-  assert.equal(ui.elements.get('collectionProgress').value,0);
+  assert.equal(progress(),'未识别相机：0 / 9 头，0/9 条');
   assert.match(ui.elements.get('datasetSummary').textContent,/已采集完毕 0 次/);
 });
 
-test('empty datasets show a zero completion progress without an invalid ratio', async () => {
+test('empty datasets show a compact zero progress', async () => {
   const ui=await setup({...dataset,frames:[],pigs:0,reviewed:0,clouds:0});
-  assert.equal(ui.elements.get('collectionProgressText').textContent,'三阶段完成 0 / 0');
-  assert.equal(ui.elements.get('collectionPercent').textContent,'0%');
-  assert.equal(ui.elements.get('collectionProgress').value,0);
-  assert.equal(ui.elements.get('collectionProgress').max,1);
+  assert.deepEqual(ui.elements.get('cameraProgressText').children.map(line=>line.textContent),
+    ['未识别相机：0 / 0 头，0/0 条']);
 });
 
 test('collapsing filters preserves scope and selections, exposes hidden conditions and remembers its state', async () => {
@@ -979,7 +1042,7 @@ test('collapsing filters preserves scope and selections, exposes hidden conditio
   assert.equal(reloaded.elements.get('filterSummary').textContent,'全部采集');
   const html=fs.readFileSync(path.join(app,'frontend','pages','index.html'),'utf8');
   const panel=html.slice(html.indexOf('<aside class="listpanel">'),html.indexOf('</aside>'));
-  assert.ok(panel.indexOf('collectionProgressText')<panel.indexOf('id="listFilters"'));
+  assert.ok(panel.indexOf('cameraProgressText')<panel.indexOf('id="listFilters"'));
   assert.ok(panel.indexOf('id="selectAll"')<panel.indexOf('id="listFilters"'));
   assert.ok(panel.indexOf('id="listFilters"')<panel.indexOf('id="frames"'));
   assert.doesNotMatch(panel,/listfooter|stagefilters/);
@@ -994,7 +1057,7 @@ test('filter disclosure still works when browser preference storage is unavailab
   assert.equal(ui.elements.get('listFilters').hidden,false);
 });
 
-test('generation from collapsed cumulative filters honors the visible scope and input eligibility', async () => {
+test('generation from collapsed cumulative filters selects the visible scope and reports eligibility', async () => {
   const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
   const clean=(id,extra={})=>frame(id,{has_cloud:true,camera:{type:'itof'},input_mode:'rgb',cloud_input_mode:'rgb',
     workflow_stages:stageStatuses({cleaning:{...keep}}),...extra});
@@ -1008,10 +1071,199 @@ test('generation from collapsed cumulative filters honors the visible scope and 
   ui.elements.get('filter').value='cleaning';ui.elements.get('filter').listeners.input();
   ui.elements.get('toggleFilters').onclick();
   assert.deepEqual(clone(ui.run('visibleRows().map(row=>row.id)')),['ready','draft','skipped','failed']);
-  assert.deepEqual(clone(ui.run('generationPlan().ids')),['ready']);
+  assert.deepEqual(clone(ui.run('[...selected]')),['ready','draft','skipped','failed']);
+  assert.deepEqual(clone(ui.run('generationPlan().ids')),['ready','draft','skipped','failed']);
   assert.match(ui.elements.get('filterSummary').textContent,/清理已确认 · iToF · RGB 分割/);
-  assert.match(ui.elements.get('generationHint').textContent,/共 1 次.*核对失败 1 次.*手动标记 1 次/);
+  assert.match(ui.elements.get('generationHint').textContent,/其中 1 次可生成.*核对失败 1 次.*手动标记 1 次/);
   assert.equal(ui.elements.get('generate').disabled,false);
   await ui.elements.get('generate').onclick();
-  assert.deepEqual(ui.requests.find(request=>request.url==='/api/generate').payload.ids,['ready']);
+  assert.deepEqual(ui.requests.find(request=>request.url==='/api/generate').payload.ids,
+    ['ready','draft','skipped','failed']);
+});
+
+test('next capture follows the filtered order and scrolls the active card into view', async () => {
+  const frames=[frame('1',{has_cloud:true,has_alignment:true}),frame('2',{has_cloud:true,has_alignment:true}),
+    frame('3',{has_cloud:true,has_alignment:true})];
+  const initial={...dataset,frames,clouds:3,results:'/clouds'},ui=await setup(initial);
+  ui.elements.get('reviewCurrent').onclick();
+  await ui.notifyProcessing({action:'busy',busy:false});
+  const selectedBefore=clone(ui.run('[...selected]'));
+  assert.equal(ui.run('current'),'1');
+  assert.equal(ui.elements.get('nextCapture').disabled,false);
+
+  ui.elements.get('nextCapture').onclick();
+  assert.equal(ui.run('current'),'2');
+  assert.equal(ui.run('workspaceView'),'cleaning');
+  assert.match(ui.elements.get('processingEditor').src,/id=2.*mode=cleaning/);
+  assert.match(ui.elements.get('frames').children[1].className,/active/);
+  assert.doesNotMatch(ui.elements.get('frames').children[0].className,/active/);
+  assert.deepEqual(clone(ui.scrollCalls.at(-1)),{block:'center',behavior:'smooth'});
+  assert.match(ui.elements.get('message').textContent,/第 2\/3 条采集.*进入点云清理/);
+  assert.deepEqual(clone(ui.run('[...selected]')),selectedBefore);
+
+  assert.equal(ui.elements.get('nextCapture').disabled,true);
+  await ui.notifyProcessing({action:'busy',busy:false});
+  assert.equal(ui.elements.get('nextCapture').disabled,false);
+  ui.elements.get('nextCapture').onclick();
+  assert.equal(ui.run('current'),'3');
+  assert.equal(ui.run('workspaceView'),'cleaning');
+  assert.match(ui.elements.get('frames').children[2].className,/active/);
+  assert.equal(ui.elements.get('nextCapture').disabled,true);
+
+  ui.elements.get('search').value='pig_2';
+  ui.elements.get('search').listeners.input();
+  assert.equal(ui.run('current'),'2');
+  assert.equal(ui.elements.get('frames').children.length,1);
+  assert.match(ui.elements.get('frames').children[0].className,/active/);
+  assert.equal(ui.elements.get('nextCapture').disabled,true);
+});
+
+test('list rebuilds preserve scroll for selection, capture clicks and state refreshes', async () => {
+  const frames=Array.from({length:30},(_,i)=>frame(String(i+1),{has_cloud:true,has_alignment:true}));
+  const initial={...dataset,frames,clouds:30,results:'/clouds'},ui=await setup(initial);
+  const list=ui.elements.get('frames'),replace=list.replaceChildren;
+  // Simulate the browser clamping scroll when list content is replaced.
+  // The normal DOM mock retains scrollTop and used to hide this regression.
+  list.replaceChildren=function(...items) { replace.call(this); this.append(...items); this.scrollTop=0; };
+  list.scrollTop=1450;
+
+  for (const checked of [false,true]) {
+    ui.elements.get('selectAll').checked=checked;
+    ui.elements.get('selectAll').onchange();
+    assert.equal(list.scrollTop,1450);
+    assert.equal(ui.run('selected.size'),checked ? 30 : 0);
+  }
+  const check=list.children[12].children[0];
+  check.checked=false;check.onchange();
+  assert.equal(list.scrollTop,1450);
+  assert.equal(ui.run("selected.has('13')"),false);
+  list.children[12].children[1].onclick();
+  assert.equal(ui.run('current'),'13');
+  assert.equal(list.scrollTop,1450);
+  await ui.notifyProcessing({action:'busy',busy:false});
+  ui.run(`accept(${JSON.stringify(initial)},false,true)`);
+  assert.equal(list.scrollTop,1450);
+  assert.equal(ui.scrollCalls.length,0);
+
+  ui.elements.get('nextCapture').onclick();
+  assert.equal(ui.run('current'),'14');
+  assert.deepEqual(clone(ui.scrollCalls),[{block:'center',behavior:'smooth'}]);
+});
+
+test('switching workflow steps keeps the same capture at the same list position', async () => {
+  const frames=[frame('1',{has_cloud:true,has_alignment:true}),frame('2',{has_cloud:true,has_alignment:true})];
+  const ui=await setup({...dataset,frames,clouds:2,results:'/clouds'});
+  ui.elements.get('frames').scrollTop=145;
+
+  ui.elements.get('alignCurrent').onclick();
+  assert.equal(ui.run('workspaceView'),'alignment');
+  assert.equal(ui.elements.get('frames').scrollTop,145);
+  await ui.notify({action:'busy',busy:false});
+
+  ui.elements.get('reviewCurrent').onclick();
+  assert.equal(ui.run('workspaceView'),'review');
+  assert.equal(ui.elements.get('frames').scrollTop,145);
+  await ui.notifyProcessing({action:'busy',busy:false});
+
+  ui.elements.get('cleanCurrent').onclick();
+  assert.equal(ui.run('workspaceView'),'cleaning');
+  assert.equal(ui.elements.get('frames').scrollTop,145);
+  assert.match(ui.elements.get('frames').children[0].className,/active/);
+});
+
+test('measurement keep reloads only the current review iframe and reports automatic rejections', async () => {
+  const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
+  const row=frame('1',{has_cloud:true,has_alignment:true,measurement_slice_count:32,measurement_usable_slices:31,
+    measurement_unusable_slices:0,measurement_pending_slices:1,
+    workflow_stages:stageStatuses({alignment:{...keep},review:{...keep,decision:'pending',version:{measurement_revision:'before'}}})});
+  const initial={...dataset,frames:[row],clouds:1,results:'/clouds'};
+  const ui=await setup(initial);ui.elements.get('reviewCurrent').onclick();
+  await ui.notifyProcessing({action:'busy',busy:false});
+  ui.elements.get('frames').scrollTop=231;
+  const scrollCount=ui.scrollCalls.length;
+  ui.elements.get('autoNextAlignment').checked=true;
+  const source=ui.elements.get('processingEditor').src,oldInstance=String(ui.run('processingInstance'));
+  assert.match(ui.elements.get('cloudKeep').title,/自动淘汰其余待定剖面/);
+  assert.match(ui.elements.get('cloudReviewHint').textContent,/确认所选.*仅确认选区.*其余待定剖面自动淘汰/);
+  const fresh={...initial,measurement_finalization:{auto_rejected_profiles:1},frames:[{...row,
+    measurement_unusable_slices:1,measurement_pending_slices:0,
+    workflow_stages:{...row.workflow_stages,review:{...keep,version:{measurement_revision:'after'}}}}]};
+  ui.sandbox.reply=async()=>fresh;
+  await ui.elements.get('cloudKeep').onclick();
+  const submitted=ui.requests.find(request=>request.url==='/api/review_cloud').payload;
+  assert.deepEqual(submitted,{dataset_id:'one',id:'1',decision:'keep',stage:'review',stage_version:{measurement_revision:'before'}});
+  assert.equal(ui.run('current'),'1');assert.equal(ui.run('workspaceView'),'review');
+  assert.notEqual(ui.elements.get('processingEditor').src,source);
+  assert.equal(ui.run('processingBusy'),true);
+  assert.equal(ui.run("state.frames[0].workflow_stages.review.version.measurement_revision"),'after');
+  assert.match(ui.elements.get('message').textContent,/测量复核已保留.*自动淘汰 1 片待定剖面.*31\/32 片可测.*1 片淘汰.*0 片待定/);
+  assert.match(ui.elements.get('frames').children[0].children[1].children[2].children[2].textContent,/淘汰 1/);
+  assert.equal(ui.elements.get('frames').scrollTop,231);
+  assert.equal(ui.scrollCalls.length,scrollCount);
+  const before=ui.requests.length;
+  await ui.notifyProcessing({action:'busy',busy:false,editor_instance:oldInstance});
+  await ui.notifyProcessing({action:'saved',editor_instance:oldInstance});
+  assert.equal(ui.run('processingBusy'),true);assert.equal(ui.requests.length,before);
+  await ui.notifyProcessing({action:'busy',busy:false});
+  assert.equal(ui.run('processingBusy'),false);assert.equal(ui.elements.get('cloudKeep').disabled,false);
+  // Keeping an already finalized review is idempotent but still loads the current server revision.
+  ui.sandbox.reply=async()=>({...fresh,measurement_finalization:{auto_rejected_profiles:0}});
+  const currentSource=ui.elements.get('processingEditor').src;
+  await ui.elements.get('cloudKeep').onclick();
+  assert.notEqual(ui.elements.get('processingEditor').src,currentSource);
+  assert.match(ui.elements.get('message').textContent,/当前没有待定剖面，无需再次淘汰.*31\/32 片可测.*1 片淘汰.*0 片待定/);
+});
+
+test('other stage decisions and failed measurement keep preserve the loaded editors', async () => {
+  const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
+  const row=frame('1',{has_cloud:true,has_alignment:true,
+    workflow_stages:stageStatuses({alignment:{...keep},review:{...keep}})});
+  for (const [stage,decision,failed] of [['cleaning','keep',false],['alignment','keep',false],
+      ['review','pending',false],['review','reject',false],['review','keep',true]]) {
+    const initial={...dataset,frames:[row],clouds:1,results:'/clouds'},ui=await setup(initial);
+    ui.run(`setWorkspaceView('${stage}')`);
+    await (stage==='alignment'?ui.notify:ui.notifyProcessing)({action:'busy',busy:false});
+    const processingSource=ui.elements.get('processingEditor').src,alignmentSource=ui.elements.get('alignmentEditor').src;
+    const instance=ui.run('processingInstance');
+    ui.sandbox.reply=async()=>{if(failed)throw new Error('测量版本已变化');return initial;};
+    await ui.elements.get({keep:'cloudKeep',pending:'cloudPending',reject:'cloudReject'}[decision]).onclick();
+    assert.equal(ui.elements.get('processingEditor').src,processingSource,`${stage}/${decision}`);
+    assert.equal(ui.elements.get('alignmentEditor').src,alignmentSource,`${stage}/${decision}`);
+    assert.equal(ui.run('processingInstance'),instance);
+    assert.equal(ui.run('current'),'1');
+    if(failed){assert.match(ui.elements.get('message').textContent,/测量版本已变化/);assert.equal(ui.run('processingBusy'),false);}
+  }
+});
+
+test('late processing state cannot overwrite the finalized review after its iframe refresh', async () => {
+  const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
+  const row=frame('1',{has_cloud:true,has_alignment:true,workflow_stages:stageStatuses({alignment:{...keep},review:{...keep,decision:'pending'}})});
+  const initial={...dataset,frames:[row],clouds:1,results:'/clouds'},ui=await setup(initial);
+  ui.elements.get('reviewCurrent').onclick();await ui.notifyProcessing({action:'busy',busy:false});
+  let finishOldState;
+  const finalized={...initial,measurement_finalization:{auto_rejected_profiles:2},frames:[{...row,
+    workflow_stages:{...row.workflow_stages,review:{...keep}}}]};
+  ui.sandbox.reply=(url)=>url==='/api/state'?new Promise(resolve=>{finishOldState=resolve;}):Promise.resolve(finalized);
+  const late=ui.notifyProcessing({action:'saved'});
+  await ui.elements.get('cloudKeep').onclick();
+  const source=ui.elements.get('processingEditor').src;
+  finishOldState(initial);await late;
+  assert.equal(ui.run("state.frames[0].workflow_stages.review.decision"),'keep');
+  assert.equal(ui.elements.get('processingEditor').src,source);
+  assert.equal(ui.run('processingBusy'),true);
+});
+
+test('measurement keep response does not reload a capture selected since submission', async () => {
+  const keep={decision:'keep',available:true,has_output:true,reviewed:true,stale:false,blocked_by:''};
+  const frames=['1','2'].map(id=>frame(id,{has_cloud:true,has_alignment:true,
+    workflow_stages:stageStatuses({alignment:{...keep},review:{...keep}})}));
+  const initial={...dataset,frames,clouds:2,results:'/clouds'},ui=await setup(initial);
+  ui.elements.get('reviewCurrent').onclick();await ui.notifyProcessing({action:'busy',busy:false});
+  let finish;ui.sandbox.reply=()=>new Promise(resolve=>{finish=resolve;});
+  const save=ui.elements.get('cloudKeep').onclick();
+  ui.run("current='2';renderList();renderViewer();controls()");
+  const source=ui.elements.get('processingEditor').src;
+  finish({...initial,measurement_finalization:{auto_rejected_profiles:0}});await save;
+  assert.equal(ui.run('current'),'2');
+  assert.equal(ui.elements.get('processingEditor').src,source);
 });

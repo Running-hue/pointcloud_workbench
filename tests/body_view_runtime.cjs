@@ -11,6 +11,8 @@ assert.ok(draws>100,'body preview must finish drawing its point cloud');
 assert.match(elements.get('status').textContent,/坐标|对齐/);
 assert.match(elements.get('quality').textContent,/RMS/);
 assert.equal(elements.get('coordinateInfo').hidden,false);
+assert.equal(vm.runInContext('yaw===0&&pitch===Math.PI/2&&zoom===1',context),true,
+  'body preview must initially use the top-down XY view');
 vm.runInContext('yaw=.8;pitch=.4;zoom=2',context);
 const before=draws;elements.get('toggleInfo').onclick();
 assert.equal(elements.get('coordinateInfo').hidden,true);
@@ -18,6 +20,10 @@ assert.equal(elements.get('toggleInfo')['aria-expanded'],'false');
 assert.equal(preferences.get('pointcloud-body-info-hidden'),'1');
 assert.ok(draws>before,'collapse must redraw at the new canvas size');
 assert.equal(vm.runInContext('yaw===.8&&pitch===.4&&zoom===2',context),true);
+elements.get('reset').onclick();
+assert.equal(vm.runInContext('yaw===0&&pitch===Math.PI/2&&zoom===1',context),true,
+  'reset must return to the default top-down XY view');
+vm.runInContext('yaw=.8;pitch=.4;zoom=2',context);
 elements.get('toggleInfo').onclick();
 assert.equal(elements.get('coordinateInfo').hidden,false);
 assert.equal(elements.get('toggleInfo')['aria-expanded'],'true');

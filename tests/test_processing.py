@@ -314,6 +314,9 @@ class ProcessingWorkflowTest(unittest.TestCase):
         payload={**self.payload,'context_id':context['context_id'],'neck_uv':[69,40]}
         fit=self.ws.alignment.fit(payload)
         self.ws.alignment.confirm({**payload,'candidate_id':fit['candidate_id'],'alignment_confirmed':True})
+        with self.assertRaisesRegex(ValueError, '页面已过期'):
+            self.ws.processing.slices({**self.proc,'slice_index':i})
+        self.context()
         self.assertEqual(self.ws.processing.slices({**self.proc,'slice_index':i})['current']['status'],'pending')
         self.assertEqual(self.ws.row(self.base['id'])['cloud_decision'], 'pending')
         self.assertTrue(self.ws.row(self.base['id'])['cloud_review_stale'])

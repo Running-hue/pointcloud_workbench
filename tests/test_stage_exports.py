@@ -410,7 +410,10 @@ class StageExportTest(unittest.TestCase):
         self.mark('alignment', 'keep')
         self.measure()
         self.mark('review', 'keep')
-        reply = self.ws.processing.features({**self.proc, 'profile_index': 1, 'status': 'unusable'})
+        # Final keep closes the pending profiles and invalidates the old editor.
+        # Reopen and change a finalized label to test version invalidation.
+        self.context()
+        reply = self.ws.processing.features({**self.proc, 'profile_index': 1, 'status': 'pending'})
         self.proc['revision'] = reply['revision']
         self.assertEqual(self.stages()['cleaning']['decision'], 'keep')
         self.assertEqual(self.stages()['alignment']['decision'], 'keep')

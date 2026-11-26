@@ -5,6 +5,7 @@ let appToken = APP_TOKEN, sessionRefresh;
 let workspaceView = 'cleaning', alignmentKey = '', alignmentBusy = false;
 let pendingAdvance = null;
 let processingKey = '', processingBusy = false;
+let processingInstance = 0;
 let filtersCollapsed = false;
 const reviewButtons = {keep:'cloudKeep', pending:'cloudPending', reject:'cloudReject'};
 try { $('autoNextAlignment').checked = localStorage.getItem('pointcloud-auto-next') === '1'; } catch {}
@@ -34,6 +35,44 @@ const stageComplete = (row, stage) => {
     !value.stale && !value.blocked_by;
 };
 const captureComplete = row => Object.keys(stageLabels).every(stage => stageComplete(row, stage));
+function currentCameraScopes() {
+  const selected = $('cameraFilter').value || 'all';
+  if (selected !== 'all') return [selected];
+  const present = ['itof', 'stereo'].filter(camera =>
+    state.frames.some(row => cameraType(row) === camera));
+  return present.length ? present : ['unknown'];
+}
+function framesForCamera(camera) {
+  return state.frames.filter(row => cameraType(row) === camera);
+}
+function cameraProgress() {
+  return currentCameraScopes().map(camera => {
+    const rows = framesForCamera(camera);
+    const groups = new Map();
+    for (const row of rows) {
+      const key = String(row.pig_id ?? '');
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    }
+    return {camera, totalPigs: groups.size,
+      completePigs: [...groups.values()].filter(group => group.every(captureComplete)).length,
+      completeCaptures: rows.filter(captureComplete).length, totalCaptures: rows.length};
+  });
+}
+function cameraScopeLabel(camera) {
+  return {itof:'iToF', stereo:'双目', unknown:'未识别相机'}[camera] || '猪头';
+}
+function renderCameraProgress(scopes) {
+  const target = $('cameraProgressText');
+  target.replaceChildren();
+  for (const scope of scopes) {
+    const line = document.createElement('span'), label = cameraScopeLabel(scope.camera);
+    line.textContent = `${label}：${scope.completePigs} / ${scope.totalPigs} 头，` +
+      `${scope.completeCaptures}/${scope.totalCaptures} 条`;
+    target.append(line);
+  }
+  target.title = '同一耳标下全部对应采集的三阶段都完成，这头猪才算完成；采集完成数按当前相机范围统计。';
+}
 const message = (text = '', error = false) => {
   for (const id of ['message', 'directoryMessage']) { $(id).textContent = text; $(id).title = text; $(id).classList.toggle('error', error); }
 };
@@ -66,7 +105,7 @@ function accept(data, paths = false, preserveCurrent = false) {
   const first = !state;
   const changedInputs = state && (data.source !== state.source || data.segmentation !== state.segmentation);
   const changedResults = state && data.results !== state.results;
-  const previousCurrent = current;
+  const previousScrollTop = $('frames').scrollTop || 0;
   state = data;
   clearTimeout(pollTimer);
   if (changedInputs) { selected.clear(); current = null; }
@@ -81,7 +120,9 @@ function accept(data, paths = false, preserveCurrent = false) {
   if (!state.frames.some(r => r.id === current) || changedResults && !state.frames.find(r => r.id === current)?.has_cloud)
     current = (state.frames.find(r => r.has_cloud) || state.frames[0])?.id;
   render(preserveCurrent);
-  if (first || paths || previousCurrent !== current) document.querySelector('.frame.active')?.scrollIntoView({block:'nearest'});
+  // Refreshing state or saving a decision must not move the capture list.
+  // Explicit capture navigation is the only operation that centers a card.
+  $('frames').scrollTop = previousScrollTop;
   const warning = workspaceWarning();
   message(warning, !!warning);
   if (running()) schedulePoll();
@@ -134,8 +175,8 @@ function renderFilterDisclosure() {
   $('filterSummary').title = '当前筛选：' + summary.join('；');
 }
 function renderList() {
-  const rows = visibleRows();
-  $('frames').replaceChildren();
+  const list = $('frames'), scrollTop = list.scrollTop || 0;
+  const rows = visibleRows(), items = [];
   for (const row of rows) {
     const item = document.createElement('div'); item.className = 'frame' + (row.id === current ? ' active' : '');
     const check = document.createElement('input'); check.type = 'checkbox'; check.checked = selected.has(row.id);
@@ -169,36 +210,52 @@ function renderList() {
       button.append(reason);
     }
     button.onclick = () => selectCapture(row.id);
-    item.append(check, button); $('frames').append(item);
+    item.append(check, button); items.push(item);
   }
   if (!rows.length) {
     const empty = document.createElement('p'); empty.className = 'muted';
     empty.textContent = '没有符合筛选条件的采集，请调整相机类型、分割来源或搜索条件。';
-    $('frames').append(empty);
+    items.push(empty);
   }
+  // Replace the complete list at once, then restore its position. Routine
+  // selection and state updates must never inherit browser scroll anchoring.
+  list.replaceChildren(...items);
   const visibleIds = new Set(rows.map(r => r.id)), hiddenSelection = [...selected].filter(id => !visibleIds.has(id)).length;
   $('selectedCount').textContent = `已勾选 ${selected.size}` + (hiddenSelection ? ` · 隐藏 ${hiddenSelection}` : '');
   $('selectedCount').title = hiddenSelection ? `当前筛选外还有 ${hiddenSelection} 次已勾选采集，生成／导出已勾选范围时会一并处理。` : '';
   $('selectAll').checked = rows.length > 0 && rows.every(r => selected.has(r.id));
   $('selectAll').indeterminate = rows.some(r => selected.has(r.id)) && !$('selectAll').checked;
-  const complete = state.frames.filter(captureComplete).length, total = state.frames.length;
-  $('collectionProgressText').textContent = `三阶段完成 ${complete} / ${total}`;
-  $('collectionPercent').textContent = `${total ? Math.round(complete * 100 / total) : 0}%`;
-  $('collectionProgress').value = complete; $('collectionProgress').max = Math.max(total, 1);
-  $('stageProgressText').textContent = Object.keys(stageLabels).map(stage =>
-    stageShortLabels[stage] + ' ' + state.frames.filter(row => stageComplete(row, stage)).length).join(' · ');
-  $('stageProgressText').title = '全部采集的当前版本已确认保留数；过期、待定、淘汰及后续停止的阶段不计入。';
-  $('listFooter').textContent = `显示 ${rows.length}/${total} · 已完成 ${rows.filter(captureComplete).length}`;
-  $('listFooter').title = `当前筛选范围 ${rows.length} 次，其中三阶段已完成 ${rows.filter(captureComplete).length} 次；全部采集 ${total} 次。`;
+  renderCameraProgress(cameraProgress());
   renderFilterDisclosure();
+  list.scrollTop = scrollTop;
 }
 function selectCapture(id) {
   if (alignmentBusy || processingBusy) return;
   current = id; renderList(); renderViewer(); controls();
 }
+function nextVisibleCapture() {
+  const rows = state ? visibleRows() : [], index = rows.findIndex(row => row.id === current);
+  return index >= 0 ? rows[index+1] || null : null;
+}
 function setWorkspaceView(view) {
+  const scrollTop = $('frames').scrollTop || 0;
   workspaceView = view;
   renderList(); renderViewer(); controls();
+  // Changing the right-hand step must not move the selected card in the list.
+  $('frames').scrollTop = scrollTop;
+}
+function centerActiveCapture(behavior = 'smooth') {
+  const list = $('frames'), active = document.querySelector('.frame.active');
+  if (!active) return;
+  const listBox = list.getBoundingClientRect?.(), itemBox = active.getBoundingClientRect?.();
+  if (listBox && itemBox && Number.isFinite(list.scrollTop)) {
+    const delta = itemBox.top + itemBox.height/2 - (listBox.top + listBox.height/2);
+    const top = Math.max(0, list.scrollTop + delta);
+    if (typeof list.scrollTo === 'function') list.scrollTo({top, behavior});
+    else list.scrollTop = top;
+  } else {
+    active.scrollIntoView?.({block:'center', behavior});
+  }
 }
 function stageLine(row, stage, detail) {
   const value = stageState(row, stage);
@@ -210,8 +267,11 @@ function currentVersionLabel(row) {
 }
 function measurementLabel(row) {
   if (!row.has_alignment) return '待对齐';
-  if (row.measurement_ready) return `已复核 ${row.measurement_usable_slices}/${row.measurement_slice_count} 片`;
-  return row.measurement_slice_count ? `已确认 ${row.measurement_usable_slices || 0}/${row.measurement_slice_count} 片` : '待复核';
+  const total = row.measurement_slice_count || 0, usable = row.measurement_usable_slices || 0;
+  const unusable = row.measurement_unusable_slices || 0;
+  if (row.measurement_ready) return `已复核 ${usable}/${total} 片`;
+  if (!total) return '待复核';
+  return `已确认 ${usable}/${total} 片` + (unusable ? ` · 淘汰 ${unusable}` : '');
 }
 function currentFiles(row) {
   return {ply:row.current_ply || (row.has_alignment ? (row.has_cleaning ? 'cloud_cleaned_body_mm.ply' : 'cloud_body_mm.ply') :
@@ -239,7 +299,9 @@ function renderViewer() {
   $('cloudReviewHint').classList.toggle('stale', !!stage.stale);
   $('cloudReviewHint').textContent = hasCloud ? `筛选对象：本次采集的“${stageLabels[workspaceView]}”阶段；测量复核：${measurementLabel(row)}。` +
     (stage.stale ? '本阶段数据变化，筛选已回到待定，请重新确认。' : stage.decision === 'reject' ?
-      '本阶段已淘汰，后续阶段停止；前面已完成的阶段仍可导出。' : '三个阶段分别筛选、分别导出；本阶段淘汰会停止后续阶段。') : '';
+      '本阶段已淘汰，后续阶段停止；前面已完成的阶段仍可导出。' : '三个阶段分别筛选、分别导出；本阶段淘汰会停止后续阶段。') +
+    (workspaceView === 'review' ? '“确认所选”仅确认选区；本阶段点击“保留”时，其余待定剖面自动淘汰，已有可测／不可测标记保留。' : '') : '';
+  $('cloudKeep').title = workspaceView === 'review' ? '保留本次测量复核，并自动淘汰其余待定剖面；已有可测／不可测标记保留' : '本阶段保留，不替代其他阶段的筛选结论';
   const aligning = workspaceView === 'alignment' && hasCloud;
   const processing = ['cleaning','review'].includes(workspaceView) && hasCloud;
   $('empty').hidden = hasCloud;
@@ -258,7 +320,7 @@ function renderViewer() {
   // Exporting changes the job, not the loaded point set. Keep editors alive
   // while the job locks editing, so they never reload against a busy workspace.
   const baseEditorKey = hasCloud ? JSON.stringify([state.dataset_id, state.results, row.id]) : '';
-  const editorKey = hasCloud ? baseEditorKey + ':' + (row.cleaning_digest || '') : '';
+  const editorKey = hasCloud ? baseEditorKey + ':' + (row.removed_points ? row.cleaning_digest || '' : '') : '';
   if (!editorKey || alignmentKey && editorKey !== alignmentKey) {
     $('alignmentEditor').removeAttribute('src'); alignmentKey = ''; alignmentBusy = false;
   }
@@ -274,7 +336,9 @@ function renderViewer() {
   }
   if (processing && processingKey !== processKey) {
     processingKey = processKey; processingBusy = true;
-    $('processingEditor').src = '/processing?' + new URLSearchParams({id:row.id, dataset_id:state.dataset_id, mode:workspaceView === 'review' ? 'review' : 'cleaning'});
+    processingInstance++;
+    $('processingEditor').src = '/processing?' + new URLSearchParams({id:row.id, dataset_id:state.dataset_id,
+      mode:workspaceView === 'review' ? 'review' : 'cleaning', editor_instance:String(processingInstance)});
   }
   const issue = row?.validation_errors?.join('；') || (row?.missing.length ? '缺少：'+row.missing.join('、') : '');
   $('captureIssue').hidden = !issue && !row?.excluded;
@@ -343,6 +407,11 @@ function controls() {
   $('reviewCurrent').disabled = locked || !state?.frames.find(r => r.id === current)?.has_cloud ||
     !!state?.frames.find(r => r.id === current)?.workflow_stages?.review?.blocked_by;
   $('autoNextAlignment').disabled = locked;
+  const nextCapture = nextVisibleCapture();
+  $('nextCapture').disabled = locked || !nextCapture;
+  $('nextCapture').title = nextCapture
+    ? `切换到当前筛选结果中的下一条：${nextCapture.pig_id} / ${nextCapture.capture_id}`
+    : '当前筛选结果中没有下一条采集';
   for (const id of ['search','filter','cameraFilter','modeFilter']) $(id).disabled = alignmentBusy || processingBusy;
   document.querySelectorAll('.frame>button').forEach(el => { el.disabled = alignmentBusy || processingBusy; });
   $('alignmentEditor').inert = busy || running();
@@ -489,18 +558,39 @@ function advanceAfterSave() {
   else message('本条已保存，当前筛选范围后面已没有待对齐采集。可在左侧回看，或导出点云成果。');
 }
 for (const [decision, button] of Object.entries(reviewButtons)) $(button).onclick = () => {
-  const id = current, plan = advancePlan(), stage = workspaceView;
+  const id = current, datasetId = state.dataset_id, plan = advancePlan(), stage = workspaceView, editorKey = processingKey;
   const version = state.frames.find(r=>r.id===id)?.workflow_stages?.[stage]?.version;
   return action(async () => {
-    accept(await api('review_cloud', {dataset_id:state.dataset_id, id, decision, stage, ...(version ? {stage_version:version} : {})}), false, true);
+    const response = await api('review_cloud', {dataset_id:datasetId, id, decision, stage, ...(version ? {stage_version:version} : {})});
+    if (state.dataset_id !== datasetId || response.dataset_id !== datasetId) return;
+    const finalizeMeasurement = stage === 'review' && decision === 'keep';
+    if (finalizeMeasurement && current === id && workspaceView === 'review' && processingKey === editorKey) processingKey = '';
+    accept(response, false, true);
     pendingAdvance = plan;
-    message(stageLabels[stage] + '已标记为' + {keep:'保留',pending:'待定',reject:'淘汰'}[decision] +
+    const rejected = response.measurement_finalization?.auto_rejected_profiles;
+    const finalizedRow = response.frames?.find(r=>r.id===id);
+    const measurementSummary = finalizedRow?.measurement_slice_count ? [
+      `当前 ${finalizedRow.measurement_usable_slices || 0}/${finalizedRow.measurement_slice_count} 片可测`,
+      `${finalizedRow.measurement_unusable_slices || 0} 片淘汰`,
+      `${finalizedRow.measurement_pending_slices || 0} 片待定`
+    ].join(' · ') + '。' : '';
+    message(finalizeMeasurement ? '测量复核已保留；' + (Number.isInteger(rejected) && rejected > 0 ?
+      `本次自动淘汰 ${rejected} 片待定剖面。` : '当前没有待定剖面，无需再次淘汰。') + measurementSummary :
+      stageLabels[stage] + '已标记为' + {keep:'保留',pending:'待定',reject:'淘汰'}[decision] +
       (decision === 'reject' ? '；本采集后续阶段停止，前序成果仍可导出。' : '；其他阶段的筛选结论分别保存。'));
   });
 };
 $('autoNextAlignment').onchange = () => {
   if (!$('autoNextAlignment').checked) pendingAdvance = null;
   try { localStorage.setItem('pointcloud-auto-next', $('autoNextAlignment').checked ? '1' : '0'); } catch {}
+};
+$('nextCapture').onclick = () => {
+  const rows = state ? visibleRows() : [], index = rows.findIndex(row => row.id === current), next = nextVisibleCapture();
+  if (!next) return;
+  workspaceView = 'cleaning';
+  selectCapture(next.id);
+  requestAnimationFrame(() => centerActiveCapture('smooth'));
+  message(`已切换到第 ${index+2}/${rows.length} 条采集：${next.pig_id} / ${next.capture_id}，并进入点云清理。`);
 };
 for (const [view, id] of Object.entries({cleaning:'cleanCurrent', alignment:'alignCurrent', review:'reviewCurrent'})) $(id).onclick = () => {
   if (current && !busy && !running() && !alignmentBusy && !processingBusy) setWorkspaceView(view);
@@ -528,11 +618,12 @@ window.addEventListener('message', async event => {
   if (data.action === 'saved') {
     const plan = advancePlan();
     try {
-      const fresh = await api('state');
+      const fresh = data.workspace_state || await api('state');
       if (data.dataset_id !== state.dataset_id || fresh.dataset_id !== state.dataset_id || data.id !== current) return;
       accept(fresh, false, true);
       pendingAdvance = plan;
-      message('坐标对齐已保存，可进入“测量复核”检查切片；采集筛选请单独确认。');
+      message(data.realigned ? '坐标对齐已更新，测量复核将按新坐标重新计算。请复核新剖面。' :
+        '坐标对齐已保存，可进入“测量复核”检查切片；采集筛选请单独确认。');
       advanceAfterSave();
     } catch(e) { message('成果已保存，工作台状态更新失败：'+e.message+'；请刷新页面。', true); }
   }
@@ -540,12 +631,14 @@ window.addEventListener('message', async event => {
 window.addEventListener('message', async event => {
   const data = event.data;
   if (event.origin !== location.origin || event.source !== $('processingEditor').contentWindow ||
-      data?.type !== 'pointcloud-processing' || !processingKey || data.dataset_id !== state?.dataset_id || data.id !== current) return;
+      data?.type !== 'pointcloud-processing' || !processingKey || data.dataset_id !== state?.dataset_id || data.id !== current ||
+      data.editor_instance !== String(processingInstance)) return;
   if (data.action === 'busy') { processingBusy = data.busy === true; controls(); }
   if (data.action === 'saved') {
     try {
       const fresh = await api('state');
-      if (fresh.dataset_id === state?.dataset_id && data.id === current) accept(fresh, false, true);
+      if (processingKey && fresh.dataset_id === state?.dataset_id && data.id === current &&
+          data.editor_instance === String(processingInstance)) accept(fresh, false, true);
     } catch (e) { message('处理记录已保存，列表更新失败：'+e.message, true); }
   }
 });
@@ -563,6 +656,9 @@ $('processingEditor').onload = () => {
 for (const id of ['source','segmentation','parent','name']) $(id).addEventListener('input', controls);
 function applyFilters() {
   if (!state) return;
+  // Each filter is a new working scope: clear old hidden selections and
+  // select every capture in the rows that remain visible.
+  selected = new Set(visibleRows().map(row => row.id));
   ensureVisibleCapture();
   renderList(); renderViewer(); controls();
 }
@@ -645,4 +741,3 @@ $('confirmExport').onclick = () => action(async () => {
   finally { exportPlan(); }
 });
 action(async () => { accept(await api('state')); });
-window.addEventListener('resize', () => requestAnimationFrame(() => document.querySelector('.frame.active')?.scrollIntoView({block:'nearest'})));

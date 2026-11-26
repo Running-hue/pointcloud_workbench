@@ -31,6 +31,55 @@ def surface(bent=False, step=2):
 
 
 class FeatureMathTest(unittest.TestCase):
+    def test_only_reviewed_historical_planes_keep_the_old_model(self):
+        for version in (features.LEGACY_CENTERLINE_VERSION, features.BLENDED_CENTERLINE_VERSION):
+            self.assertEqual(features.centerline_version({'centerline_version': version}), features.CENTERLINE_VERSION)
+            self.assertEqual(features.centerline_version({'centerline_version': version,
+                'feature_reviews': {'0': 'pending'}}), features.CENTERLINE_VERSION)
+            self.assertEqual(features.centerline_version({'centerline_version': version,
+                'feature_reviews': {'0': 'usable'}}), version)
+
+    def test_centerline_joins_marked_endpoints_and_keeps_supported_bend(self):
+        p = surface(True)+[0, 65, 0]
+        old = features.calculate(p, 1000, centerline_version=features.LEGACY_CENTERLINE_VERSION)
+        got = features.calculate(p, 1000)
+        xy = np.asarray(got['centerline']['xy_mm'])
+        np.testing.assert_allclose(xy[[0, -1]], [[0, 0], [1000, 0]], atol=1e-10)
+        self.assertGreater(xy[128, 1], 200)  # Follow the bend, not a straight chord.
+        self.assertLess(np.max(np.abs(xy[64:193, 1]-np.asarray(old['centerline']['xy_mm'])[64:193, 1])), 25)
+        for row, endpoint in zip([got['profiles'][0], got['profiles'][-1]], xy[[0, -1]]):
+            np.testing.assert_allclose([row['center_x_mm'], row['center_y_mm']], endpoint)
+        self.assertNotEqual(got['geometry']['visible_centerline_arc_mm'], old['geometry']['visible_centerline_arc_mm'])
+        self.assertNotEqual(got['profiles'][0]['tangent_y'], old['profiles'][0]['tangent_y'])
+        self.assertEqual(got['centerline']['version'], features.CENTERLINE_VERSION)
+        self.assertEqual(got['centerline']['xy_mm'], features.calculate(p, 1000, {'count': 64})['centerline']['xy_mm'])
+
+    def test_endpoints_constrain_the_whole_fit_without_short_end_connectors(self):
+        p = surface()+[0, 55, 0]
+        got = features.calculate(p, 1000)
+        xy = np.asarray(got['centerline']['xy_mm'])
+        blended = features.calculate(p, 1000, centerline_version=features.BLENDED_CENTERLINE_VERSION)
+        old_xy = np.asarray(blended['centerline']['xy_mm'])
+        # A nearly parallel but offset envelope must yield a broad smooth bow,
+        # not preserve its old flat middle and turn sharply at each endpoint.
+        self.assertLess(xy[32, 1], 40)
+        self.assertGreater(xy[128, 1], 40)
+        self.assertGreater(np.max(np.abs(xy[32:65, 1]-old_xy[32:65, 1])), 10)
+        slope = np.diff(xy[:, 1])/np.diff(xy[:, 0])
+        self.assertLess(np.max(np.abs(slope)), .4)
+        self.assertLess(np.max(np.abs(np.diff(slope))), .015)
+        np.testing.assert_allclose(xy[:, 1], xy[::-1, 1], atol=1e-8)
+        self.assertTrue(all(got['centerline']['supported']))
+
+    def test_endpoint_constraints_do_not_create_support_for_missing_ends(self):
+        p = surface()+[0, 50, 0]
+        got = features.calculate(p[p[:, 0] >= 100], 1000)
+        self.assertFalse(got['centerline']['supported'][0])
+        self.assertFalse(got['profiles'][0]['centerline_supported'])
+        self.assertIsNone(got['geometry']['visible_centerline_arc_mm']['value'])
+        self.assertIsNone(got['profiles'][0]['width_q02_q98_mm'])
+        self.assertFalse(features.arrays(got)['usable_mask'].any())
+
     def test_straight_surface_known_width_arc_curvature_and_height(self):
         p = surface(); original = p.copy()
         r = features.calculate(p, 1000, conditions={'endpoints':'complete', 'ground':'reliable'})
@@ -187,11 +236,17 @@ class FeatureWorkflowTest(unittest.TestCase):
         self.assertTrue((self.root/'features-export'/'geometry_features.csv').is_file())
         computed=read_json(dest/'geometry_features.json')
         self.assertEqual(computed['schema_version'], 'visible-surface-features-v2')
+        self.assertEqual(computed['centerline']['version'], features.CENTERLINE_VERSION)
+        with np.load(dest/'profile_sequence.npz', allow_pickle=False) as saved:
+            self.assertEqual(str(saved['centerline_version']), features.CENTERLINE_VERSION)
         self.assertIn('visible_transverse_arc_mm', computed['profiles'][0])
         with (dest/'profile_sequence.csv').open(encoding='utf-8-sig',newline='') as stream:
             columns = csv.DictReader(stream).fieldnames
         for prefix in ['', 'valid_', 'usable_', 'reviewed_']:
             self.assertIn(prefix+'visible_transverse_arc_mm', columns)
+        self.assertIn('centerline_version', columns)
+        with (self.root/'features-export'/'geometry_features.csv').open(encoding='utf-8-sig', newline='') as stream:
+            self.assertEqual(next(csv.DictReader(stream))['centerline_version'], features.CENTERLINE_VERSION)
         self.assertEqual(computed['geometry'],response['features']['geometry'])
         self.assertEqual(computed['provenance']['relative_dir'],self.rel)
         self.assertFalse((dest/'pointcloud_cleaning.json').exists())
@@ -248,6 +303,104 @@ class FeatureWorkflowTest(unittest.TestCase):
         row = self.ws.row(self.base['id'])
         self.assertEqual((row['measurement_usable_slices'], row['measurement_slice_count']), (0, 64))
         self.assertFalse(row['measurement_ready'])
+
+    def test_reconfirming_in_the_same_editor_recomputes_geometry_and_profiles(self):
+        self.aligned()
+        service = self.ws.processing
+        first = service.features({**self.proc, 'profile_index': 31, 'status': 'unusable'})
+        old_editor = {**self.proc, 'revision': first['revision'], 'profile_index': 31}
+        before = self.ws.row(self.base['id'])
+        self.ws.review_cloud({**self.base, 'stage': 'review', 'decision': 'keep'})
+
+        # Reuse the open alignment editor and move both endpoints.
+        payload = {**self.payload, 'tail_uv': [35, 42], 'neck_uv': [65, 39]}
+        fit = self.ws.alignment.fit(payload)
+        saved = self.ws.alignment.confirm({**payload, 'candidate_id': fit['candidate_id'], 'alignment_confirmed': True})
+        row = saved['workspace_state']['frames'][0]
+        self.assertTrue(saved['realigned'])
+        self.assertNotEqual(row['alignment_revision'], before['alignment_revision'])
+        self.assertTrue(row['workflow_stages']['review']['stale'])
+        self.assertEqual(row['workflow_stages']['review']['decision'], 'pending')
+        with self.assertRaisesRegex(ValueError, '页面已过期'):
+            service.features({**old_editor, 'status': 'usable'})
+        new_context = service.context(self.base)
+        with self.assertRaisesRegex(ValueError, '对齐坐标已更新'):
+            service.features({**self.base, 'context_id': new_context['context_id'],
+                'revision': new_context['revision'], 'status': 'usable', 'profile_index': 31,
+                'alignment_reference_id': first['features']['provenance']['reference_id']})
+
+        def verify_latest(workspace):
+            base = {**self.base, 'dataset_id': workspace.dataset_id}
+            context = workspace.processing.context(base)
+            features = workspace.processing.features({**base, 'context_id': context['context_id'],
+                'revision': context['revision'], 'profile_index': 31})['features']
+            length = fit['record']['frame']['neck_tail_horizontal_span_mm']
+            self.assertEqual(context['alignment']['reference_id'], saved['reference_id'])
+            self.assertEqual(features['provenance']['reference_id'], saved['reference_id'])
+            self.assertAlmostEqual(features['geometry']['endpoint_ground_chord_mm']['value'], length)
+            self.assertNotEqual(features['geometry']['endpoint_ground_chord_mm'],
+                                first['features']['geometry']['endpoint_ground_chord_mm'])
+            self.assertNotEqual(features['profiles'][-1]['center_x_mm'], first['features']['profiles'][-1]['center_x_mm'])
+            np.testing.assert_allclose(np.asarray(features['centerline']['xy_mm'])[[0, -1]],
+                                       [[0, 0], [length, 0]], atol=1e-10)
+            self.assertNotEqual(features['centerline']['xy_mm'], first['features']['centerline']['xy_mm'])
+            self.assertTrue(all(profile['status'] == 'pending' for profile in features['profiles']))
+
+        verify_latest(self.ws)
+        verify_latest(Workspace(self.ws.state_dir, initial_results=self.results))
+
+    def test_historical_review_keeps_its_curve_until_explicit_recalculation(self):
+        self.aligned()
+        service = self.ws.processing
+        ctx = service.contexts[self.rel]
+        # A pre-fix record has reviews and no centerline version.
+        ctx['measurement'] = {'reference_id': ctx['alignment']['reference_id'],
+            'cleaning_digest': service._measurement(ctx)['cleaning_digest'],
+            'feature_reviews': {'1': 'unusable'}}
+        old = service.features(self.proc)
+        self.assertEqual(old['features']['centerline']['version'], features.LEGACY_CENTERLINE_VERSION)
+        self.assertEqual(old['features']['profiles'][1]['status'], 'unusable')
+        saved = service.features({**self.proc, 'profile_index': 2, 'status': 'unusable'})
+        self.proc['revision'] = saved['revision']
+        self.ws.review_cloud({**self.base, 'stage': 'review', 'decision': 'keep'})
+        before = self.ws.row(self.base['id'])
+        restored = Workspace(self.ws.state_dir, initial_results=self.results)
+        base = {**self.base, 'dataset_id': restored.dataset_id}
+        context = restored.processing.context(base)
+        payload = {**base, 'context_id': context['context_id'], 'revision': context['revision']}
+        old = restored.processing.features(payload)['features']
+        self.assertEqual(old['centerline']['version'], features.LEGACY_CENTERLINE_VERSION)
+        self.assertEqual(old['profiles'][1]['status'], 'unusable')
+        self.assertEqual(restored.row(base['id'])['workflow_stages']['review'], before['workflow_stages']['review'])
+        dest = self.root/'historical-export'; dest.mkdir()
+        exported = restored.processing.export_features_to(dest, restored.results[self.rel], source_folder=restored.results[self.rel]['folder'])
+        self.assertEqual(exported['centerline'], old['centerline'])
+        self.assertEqual(exported['profiles'], old['profiles'])
+        new = restored.processing.features({**payload, 'settings': old['settings']})['features']
+        self.assertEqual(new['centerline']['version'], features.CENTERLINE_VERSION)
+        self.assertEqual(new['provenance']['centerline_version'], features.CENTERLINE_VERSION)
+        self.assertTrue(all(row['status'] == 'pending' for row in new['profiles']))
+        self.assertTrue(restored.row(base['id'])['workflow_stages']['review']['stale'])
+        self.assertEqual(restored.row(base['id'])['workflow_stages']['review']['decision'], 'pending')
+
+    def test_blended_curve_review_keeps_its_method_on_restart_and_upgrades_explicitly(self):
+        self.aligned()
+        service = self.ws.processing
+        ctx = service.contexts[self.rel]
+        ctx['measurement'] = {**service._measurement(ctx),
+            'centerline_version': features.BLENDED_CENTERLINE_VERSION, 'feature_reviews': {'1': 'unusable'}}
+        saved = service.features({**self.proc, 'profile_index': 2, 'status': 'unusable'})
+        self.assertEqual(saved['features']['centerline']['version'], features.BLENDED_CENTERLINE_VERSION)
+        restored = Workspace(self.ws.state_dir, initial_results=self.results)
+        base = {**self.base, 'dataset_id': restored.dataset_id}
+        context = restored.processing.context(base)
+        payload = {**base, 'context_id': context['context_id'], 'revision': context['revision']}
+        old = restored.processing.features(payload)['features']
+        self.assertEqual(old['centerline'], saved['features']['centerline'])
+        self.assertEqual([r['status'] for r in old['profiles']], [r['status'] for r in saved['features']['profiles']])
+        new = restored.processing.features({**payload, 'settings': old['settings']})['features']
+        self.assertEqual(new['centerline']['version'], features.CENTERLINE_VERSION)
+        self.assertTrue(all(row['status'] == 'pending' for row in new['profiles']))
 
     def test_cleaning_and_reference_changes_invalidate_only_profile_reviews(self):
         self.aligned()
