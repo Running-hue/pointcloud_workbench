@@ -75,7 +75,39 @@ canvas.onpointerup=endDrag;canvas.onpointercancel=endDrag;canvas.oncontextmenu=e
 document.querySelectorAll('[data-tool]').forEach(b=>b.onclick=()=>{tool=b.dataset.tool;document.querySelectorAll('[data-tool]').forEach(x=>x.classList.toggle('active',x===b));$('toolHint').textContent=hints[tool];saveDraft();controls()});
 $('undo').onclick=()=>{if(tool==='ground')polygon.pop();else if(tool==='tail')tail=null;else neck=null;invalidate();draw()};$('clear').onclick=()=>{polygon=[];tail=neck=null;invalidate();draw()};$('threshold').oninput=invalidate;$('imageMode').onchange=()=>action(async()=>{await showImage();saveDraft()});
 $('showForeground').onchange=()=>{draw();saveDraft()};$('brightness').oninput=()=>{$('brightnessValue').textContent=Number($('brightness').value).toFixed(1)+'×';draw();saveDraft()};$('resetBrightness').onclick=()=>{$('brightness').value='1';$('brightness').oninput()};
-async function fit(reuse=false){invalidate();message(reuse?'正在复用同次采集的坐标参考…':'正在拟合地面并建立猪体坐标…');const result=await api('alignment/fit',{context_id:context.context_id,ground_polygon:polygon,tail_uv:tail,neck_uv:neck,threshold_mm:Number($('threshold').value),reuse_reference:reuse,display_mode:$('imageMode').value,display_brightness:Number($('brightness').value)});candidate=result;const a=result.record.annotations;if(reuse){polygon=a.ground_polygon;tail=a.tail.pixel_uv_native;neck=a.neck.pixel_uv_native;$('threshold').value=result.record.ground_quality.threshold_mm;draw();saveDraft()}$('preview').src='/api/alignment/preview?'+new URLSearchParams({...base,context_id:context.context_id,candidate_id:result.candidate_id});$('preview').hidden=false;$('previewEmpty').hidden=true;$('checkImage').src=result.check_image;$('checkDetails').hidden=false;$('referenceStatus').textContent=reuse?'已复用同次采集坐标，待核对':'对齐预览，待核对';const q=result.record.ground_quality;$('quality').textContent=`地面候选 ${q.candidate_points.toLocaleString()} 点，内点 ${(q.inlier_ratio*100).toFixed(1)}%，拟合 RMS ${q.inlier_rmse_mm.toFixed(2)} mm。拟合残差不能代替实际测量精度验证。`;message(result.record.warnings.join(' ')||'请从俯视、侧视核对方向，并展开地面与坐标轴检查图。')}
+async function fit(reuse = false) {
+ const confirmedReference = context.confirmedReference || context.saved_alignment?.reference_id;
+ invalidate();
+ message(reuse ? '正在复用同次采集的坐标参考…' : '正在拟合地面并建立猪体坐标…');
+ const result = await api('alignment/fit', {
+  context_id:context.context_id, ground_polygon:polygon, tail_uv:tail, neck_uv:neck,
+  threshold_mm:Number($('threshold').value), reuse_reference:reuse,
+  display_mode:$('imageMode').value, display_brightness:Number($('brightness').value)
+ });
+ candidate = result;
+ const record = result.record;
+ if (reuse) {
+  const annotations = record.annotations;
+  polygon = annotations.ground_polygon;
+  tail = annotations.tail.pixel_uv_native;
+  neck = annotations.neck.pixel_uv_native;
+  $('threshold').value = record.ground_quality.threshold_mm;
+  draw();
+  saveDraft();
+ }
+ const previewQuery = new URLSearchParams({...base, context_id:context.context_id, candidate_id:result.candidate_id});
+ $('preview').src = '/api/alignment/preview?' + previewQuery;
+ $('preview').hidden = false;
+ $('previewEmpty').hidden = true;
+ $('checkImage').src = result.check_image;
+ $('checkDetails').hidden = false;
+ $('referenceStatus').textContent = reuse ? '已复用同次采集坐标，待核对' : '对齐预览，待核对';
+ const q = record.ground_quality;
+ $('quality').textContent = `地面候选 ${q.candidate_points.toLocaleString()} 点，内点 ${(q.inlier_ratio*100).toFixed(1)}%，拟合 RMS ${q.inlier_rmse_mm.toFixed(2)} mm。拟合残差不能代替实际测量精度验证。`;
+ const length = record.frame.neck_tail_horizontal_span_mm.toFixed(1);
+ const referenceHint = record.reference_id === confirmedReference ? '本次计算与当前已确认坐标一致。' : '请从俯视、侧视核对端点和方向。';
+ message([`尾根到颈根的地面投影 ${length} mm。`, referenceHint, ...record.warnings].join(' '));
+}
 $('fit').onclick=()=>action(()=>fit(false));$('reuse').onclick=()=>action(()=>fit(true));$('reload').onclick=()=>action(load);
 async function choose(field,title){const result=await api('choose_directory',{path:$(field).value,title});if(!result.cancelled)$(field).value=result.path;return !result.cancelled}
 $('browseRaw').onclick=()=>action(async()=>{if(await choose('rawRoot','选择原始采集根目录'))await load()});
@@ -85,11 +117,15 @@ $('save').onclick=()=>action(async()=>{
  saved=await api('alignment/confirm',{context_id:context.context_id,candidate_id:candidate.candidate_id,
   alignment_confirmed:true});
  context.reference=true;
+ context.confirmedReference=saved.reference_id;
  $('preview').src='/api/media?'+new URLSearchParams({...base,file:'body_preview.html',cleaned:'1',revision:saved.reference_id});
  try{sessionStorage.removeItem(draftKey)}catch{}
- notify('saved',{output:saved.output,cached:true});$('savedPath').textContent=saved.output;$('saved').hidden=false;
+ notify('saved',{workspace_state:saved.workspace_state,realigned:saved.realigned});
+ $('savedPath').textContent=saved.output;$('saved').hidden=false;
  $('referenceStatus').textContent='本条已确认 · 待统一导出';
- message(saved.warning||'已确认坐标对齐，可继续下一条；最后点击顶部“导出点云成果”一次保存整批成果。');candidate=null;
+ message(saved.warning || (saved.realigned ? '已更新坐标对齐。进入“测量复核”检查重新计算的几何特征和剖面。' :
+  '已确认坐标对齐，可继续下一条；最后点击顶部“导出点云成果”一次保存整批成果。'));
+ candidate=null;
 });
 $('openSaved').onclick=()=>{if(!saved)return;if(embedded){notify('view-saved');return}location.href='/'};
 action(async()=>{

@@ -10,7 +10,7 @@ $('count').textContent=`${r.display_filtered?'清理后点云':'完整点云'} $
 if(r.display_filtered){$('status').textContent+=' · 清理版本';const links=$('files').querySelectorAll('a');links[0].textContent='原始猪体坐标 PLY';links[1].textContent='原始 NPZ';}
 $('quality').textContent=`地面内点 ${(r.ground_quality.inlier_ratio*100).toFixed(1)}% · 拟合残差 RMS ${r.ground_quality.inlier_rmse_mm.toFixed(2)} mm（不代表实际测量精度）`;
 $('warnings').textContent=r.warnings.join(' ');$('reference').textContent='坐标参考 '+r.reference_id;$('files').hidden=!r.confirmed;
-let yaw=-.35,pitch=.6,zoom=1,drag=null;
+const DEFAULT_YAW=0,DEFAULT_PITCH=Math.PI/2;let yaw=DEFAULT_YAW,pitch=DEFAULT_PITCH,zoom=1,drag=null;
 const bounds=[0,1,2].map(j=>{const a=DATA.xyz.map(p=>p[j]).sort((a,b)=>a-b);return [a[Math.floor(a.length*.005)],a[Math.min(a.length-1,Math.floor(a.length*.995))]]});
 bounds[2][0]=Math.min(bounds[2][0],0);bounds[0][0]=Math.min(bounds[0][0],0);
 const center=bounds.map(b=>(b[0]+b[1])/2),extent=Math.max(1,...bounds.map(b=>b[1]-b[0]));
@@ -25,7 +25,7 @@ ctx.font='12px system-ui';[[250,0,0],[0,250,0],[0,0,250]].forEach((p,i)=>{const 
 for(const [key,label] of [['tail','尾根'],['neck','颈根']]){const p=r.annotations[key].xyz_camera_mm,m=r.frame.camera_to_body_4x4,q=m.slice(0,3).map(row=>row[0]*p[0]+row[1]*p[1]+row[2]*p[2]+row[3]);line([q[0],q[1],0],q,'#8a7048',2);const s=screen(q);ctx.fillStyle='#925a2a';ctx.beginPath();ctx.arc(s[0],s[1],4,0,2*Math.PI);ctx.fill();ctx.fillText(label,s[0]+6,s[1]-6)}
 ctx.fillStyle='#68798b';ctx.fillText('250 mm 地面网格',16,24)}
 canvas.onpointerdown=e=>{drag=[e.clientX,e.clientY];canvas.setPointerCapture(e.pointerId)};canvas.onpointermove=e=>{if(!drag)return;yaw+=(e.clientX-drag[0])*.008;pitch=Math.max(-1.5,Math.min(1.57,pitch+(e.clientY-drag[1])*.008));drag=[e.clientX,e.clientY];draw()};canvas.onpointerup=canvas.onpointercancel=()=>drag=null;canvas.onwheel=e=>{e.preventDefault();zoom=Math.max(.2,Math.min(8,zoom*Math.exp(-e.deltaY*.001)));draw()};
-document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{[yaw,pitch]=({top:[0,Math.PI/2],side:[0,0],rear:[Math.PI/2,0],oblique:[-.35,.6]})[b.dataset.view];draw()});$('reset').onclick=()=>{yaw=-.35;pitch=.6;zoom=1;draw()};canvas.ondblclick=$('reset').onclick;window.onresize=draw;
+document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{[yaw,pitch]=({top:[DEFAULT_YAW,DEFAULT_PITCH],side:[0,0],rear:[Math.PI/2,0],oblique:[-.35,.6]})[b.dataset.view];draw()});$('reset').onclick=()=>{yaw=DEFAULT_YAW;pitch=DEFAULT_PITCH;zoom=1;draw()};canvas.ondblclick=$('reset').onclick;window.onresize=draw;
 function setInfoHidden(hidden){$('coordinateInfo').hidden=hidden;$('toggleInfo').textContent=hidden?'显示说明':'隐藏说明';$('toggleInfo').setAttribute('aria-expanded',String(!hidden));draw()}
 $('toggleInfo').onclick=()=>{const hidden=!$('coordinateInfo').hidden;setInfoHidden(hidden);try{localStorage.setItem('pointcloud-body-info-hidden',hidden?'1':'0')}catch{}};
 window.addEventListener('storage',e=>{if(e.key==='pointcloud-body-info-hidden')setInfoHidden(e.newValue==='1')});

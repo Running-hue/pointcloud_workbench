@@ -19,7 +19,7 @@ from .core import (np, cv2, Image, backproject, project, sha256, read_json,
                    camera_identity, input_mode, sample_rgb)
 from .registration import rgb_timing, depth_to_color
 from .paths import TEMPLATES_DIR
-from .workflow import workflow_state
+from .workflow import stage_version, workflow_state
 
 VERSION = 'ground-body-mm-v1'
 SIDE_FILES = {'alignment.json', 'body_points.npz', 'cloud_body_mm.ply',
@@ -351,7 +351,7 @@ class AlignmentService:
                        source_key=source_key, reference=reference, xyz=xyz, valid=valid, fg=fg,
                        profile=stream['profile'], base=backgrounds[default_mode], cloud=cloud,
                        working_keep=working_keep,
-                       cleaning_digest=result.get('processing', {}).get('record', {}).get('cleaning_digest', ''),
+                       cleaning_digest=stage_version(result, 'cleaning')['cleaning_digest'],
                        backgrounds=backgrounds, default_display_mode=default_mode,
                        input_cloud_sha256=sha256(result['folder']/'points.npz'),
                        input_report_sha256=sha256(result['folder']/'pointcloud.json'))
@@ -392,7 +392,7 @@ class AlignmentService:
                 or sha256(ctx['folder']/'pointcloud.json') != ctx['input_report_sha256']):
             raise ValueError('当前点云已变化，请重新打开坐标对齐')
         result = self.ws.results[ctx['row']['relative_dir']]
-        if result.get('processing', {}).get('record', {}).get('cleaning_digest', '') != ctx.get('cleaning_digest', ''):
+        if stage_version(result, 'cleaning')['cleaning_digest'] != ctx['cleaning_digest']:
             raise ValueError('点云清理版本已变化，请重新载入坐标对齐场景')
         return ctx
 
@@ -628,6 +628,17 @@ class AlignmentService:
                 ctx['reference'] = reference
             except OSError:
                 warning += ' 成果已保存，但未能缓存同次采集坐标参考；可从 alignment.json 恢复。'
-            return {'output': str(target), 'relative_dir': ctx['row']['relative_dir'],
-                    'reference_id': record['reference_id'], 'warning': warning, 'attached': attached, 'cached': cached,
-                    'cloud_decision': decision}
+            previous_reference = previous_result.get('alignment_reference_id')
+            reference_changed = attached and previous_reference != record['reference_id']
+            if reference_changed:
+                # An open editor still displays the previous profile positions.
+                # Require a new context before accepting another review from it.
+                self.ws.processing.contexts.pop(relative_dir, None)
+            response = {'output': str(target), 'relative_dir': relative_dir,
+                        'reference_id': record['reference_id'], 'warning': warning, 'attached': attached,
+                        'cached': cached, 'cloud_decision': decision}
+            if cached:
+                # Publish the committed revision before the parent can switch steps.
+                response['workspace_state'] = self.ws.state()
+                response['realigned'] = bool(previous_reference and reference_changed)
+            return response

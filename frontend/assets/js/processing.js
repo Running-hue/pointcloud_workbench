@@ -4,7 +4,8 @@ const offline = typeof OFFLINE_DATA !== 'undefined';
 const query = new URLSearchParams(location.search), identity = {id: query.get('id'), dataset_id: query.get('dataset_id')};
 const pageMode = offline ? (OFFLINE_DATA.alignment ? 'review' : 'preview') : (query.get('mode') === 'review' ? 'review' : 'cleaning');
 let token = APP_TOKEN, data, busy = false, boxMode = '', drag, rectangle;
-let yaw = -.35, pitch = -.4, zoom = 1, pan = [0, 0], center = [0, 0, 0], extent = 1;
+let yaw = pageMode === 'review' ? 0 : -.35, pitch = pageMode === 'review' ? Math.PI/2 : -.4;
+let zoom = 1, pan = [0, 0], center = [0, 0, 0], extent = 1;
 let sourceKind = 'candidate';
 let geometry, profileIndex = 0, profileYZ = [], profileTimer;
 let geometryDirty = false;
@@ -22,7 +23,8 @@ function configureMode() {
   $('fit').querySelector('[value=selected]').hidden = !cleaning;
   document.body.dataset.mode = pageMode;
 }
-function notify(action, extra = {}) { if (!offline && parent !== window) parent.postMessage({type:'pointcloud-processing', ...identity, action, ...extra}, location.origin); }
+function notify(action, extra = {}) { if (!offline && parent !== window) parent.postMessage({type:'pointcloud-processing', ...identity,
+  editor_instance:query.get('editor_instance') || '', action, ...extra}, location.origin); }
 function message(text = '', error = false) { $('message').textContent = text; $('message').classList.toggle('error', error); }
 function base(extra = {}) { return {...identity, context_id:data?.context_id, revision:data?.revision || '', ...extra}; }
 async function api(method, payload) {
@@ -47,7 +49,12 @@ function apply(response, refit = false) {
   if (!data.alignment) $('coordinate').value = 'camera';
   else if (pageMode === 'review') $('coordinate').value = 'body';
   $('counts').textContent = `保留 ${data.kept_count.toLocaleString()} / ${data.total.toLocaleString()} 点`;
-  $('alignmentHint').textContent = pageMode === 'review' ? (data.alignment ? '使用已确认的猪体坐标和当前清理版本，按区域或逐片检查可见边界。' : '尚未完成坐标对齐，测量功能暂不可用。') : (data.alignment ? '坐标参考已确认；清理版本沿用同次采集的参考。' : '先查看并保守清理飞点，再进入坐标对齐。');
+  if (pageMode === 'review') {
+    const span = data.alignment?.frame.neck_tail_horizontal_span_mm;
+    $('alignmentHint').textContent = Number.isFinite(span) ? `本次对齐 · 尾根到颈根的地面投影 ${fmt(span)} mm` : '';
+  } else {
+    $('alignmentHint').textContent = data.alignment ? '坐标参考已确认，清理版本沿用同次采集的参考。' : '先查看并保守清理飞点，再进入坐标对齐。';
+  }
   $('originalQuality').textContent = data.report ? `生成时有效深度率 ${(data.report.original_valid_depth_ratio*100).toFixed(2)}%；删点后不会将它改记为 100%。` : `已删除 ${data.removed_count.toLocaleString()} 点；原始点云另存。`;
   $('originalQuality').title=$('originalQuality').textContent;
   if(['review','cleaning'].includes(pageMode) && data.report)$('originalQuality').textContent=`生成时有效深度率 ${(data.report.original_valid_depth_ratio*100).toFixed(2)}% · 删点不改写`;
@@ -81,16 +88,31 @@ function controls() {
   $('applySelection').disabled = cleaningLocked || !data?.candidate_count;
   $('clearSelection').disabled = cleaningLocked || !data?.candidate_count;
   $('sourceImage').disabled = locked || !data?.image_url;
+  $('alignmentMarks').hidden = pageMode !== 'review' || offline || !data?.alignment_revision || !data.alignment;
+  $('alignmentMarks').disabled = locked;
   $('reloadData').disabled = busy || offline;
   $('coordinate').disabled = busy || !data || offline || pageMode === 'review';
   $('margin').disabled = cleaningLocked || $('method').value === 'neighbor';
   for (const id of ['neighbors','neighborDistance']) $(id).disabled = cleaningLocked || $('method').value === 'far';
 }
 function isBody() { return $('coordinate').value === 'body'; }
-function point(p) {
-  if (!isBody() || (offline && data.offline_body)) return p;
+function cameraToBody(p) {
   const m = data.alignment.frame.camera_to_body_4x4;
   return m.slice(0,3).map(row => row[0]*p[0]+row[1]*p[1]+row[2]*p[2]+row[3]);
+}
+function point(p) {
+  return isBody() && !(offline && data.offline_body) ? cameraToBody(p) : p;
+}
+function centerlinePoint(xy) {
+  const annotations=data.alignment?.annotations;
+  if(geometry?.centerline?.version?.startsWith('endpoint-constrained-') && annotations?.tail && annotations?.neck) {
+    const tail=cameraToBody(annotations.tail.xyz_camera_mm),neck=cameraToBody(annotations.neck.xyz_camera_mm);
+    const t=xy[0]/data.alignment.frame.neck_tail_horizontal_span_mm;
+    // Only XY is measured. Interpolate display height so both ends touch the
+    // marked points in every view; this is not a measured dorsal ridge.
+    return [...xy,tail[2]+t*(neck[2]-tail[2])];
+  }
+  return [...xy,center[2]];
 }
 function matrix() {
   const c = Math.cos(yaw), s = Math.sin(yaw), a = Math.sin(pitch), b = Math.cos(pitch);
@@ -124,7 +146,7 @@ function draw() {
   if (!w || !h) return;
   canvas.width = Math.round(w*d); canvas.height = Math.round(h*d); ctx.setTransform(d,0,0,d,0,0);
   ctx.fillStyle = '#eef2f6'; ctx.fillRect(0,0,w,h); if (!data) return;
-  const legend = pageMode === 'cleaning' ? '红色为选中点' : pageMode === 'review' ? (geometry ? '蓝线为中心线走向示意 · 橙色为局部剖面' : data.alignment ? '已对齐' : '待坐标对齐') : '只读预览';
+  const legend = pageMode === 'cleaning' ? '红色为选中点' : pageMode === 'review' ? (geometry ? '蓝线为 XY 中心线（高度示意）· 橙色为局部剖面' : data.alignment ? '已对齐' : '待坐标对齐') : '只读预览';
   $('viewBadge').textContent = `${isBody() ? '猪体' : '相机'}坐标 · ${legend} · 已删 ${data.removed_count.toLocaleString()} 点`;
   const names=isBody()?{top:'俯视 XY',side:'侧视 XZ',rear:'后视 YZ',oblique:'斜视'}:{top:'相机正视',side:'侧视',rear:'上方视图',oblique:'斜视'};
   document.querySelectorAll('[data-view]').forEach(b=>b.textContent=names[b.dataset.view]);
@@ -157,11 +179,24 @@ function draw() {
   ctx.fillStyle='#db4236';for(const p of highlights)ctx.fillRect(p.x-1,p.y-1,3,3);
   if(profile) {
     const xy=geometry.centerline.xy_mm,valid=geometry.centerline.supported;
-    const z=center[2]; // Display XY reference on the view's mid-height plane; no dorsal ridge inference.
-    for(let i=1;i<xy.length;i++)if(valid[i-1]&&valid[i])line([...xy[i-1],z],[...xy[i],z],'#3979c8',2);
+    const z=centerlinePoint([profile.center_x_mm,profile.center_y_mm])[2];
+    for(let i=1;i<xy.length;i++)if(valid[i-1]&&valid[i])line(centerlinePoint(xy[i-1]),centerlinePoint(xy[i]),'#3979c8',2);
     const u=profile.width_raw_span_mm || 200;
     line([profile.center_x_mm-profile.tangent_y*u/2,profile.center_y_mm+profile.tangent_x*u/2,z],
       [profile.center_x_mm+profile.tangent_y*u/2,profile.center_y_mm-profile.tangent_x*u/2,z],'#d88920',2);
+  }
+  if (pageMode === 'review' && isBody()) {
+    const annotations = data.alignment.annotations;
+    for (const [key, label, color] of [['tail','尾根','#a7442d'], ['neck','颈根','#2859a8']]) {
+      const anchor = annotations?.[key]?.xyz_camera_mm;
+      if (!anchor) continue;
+      const [x,y] = screen(cameraToBody(anchor));
+      ctx.beginPath(); ctx.arc(x,y,4,0,2*Math.PI);
+      ctx.fillStyle = color; ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.font = 'bold 12px system-ui'; ctx.lineWidth = 3;
+      ctx.strokeText(label,x+7,y-6); ctx.fillText(label,x+7,y-6);
+    }
   }
   if(rectangle){ctx.fillStyle='#db423622';ctx.strokeStyle='#b94d42';ctx.lineWidth=1;ctx.fillRect(rectangle[0],rectangle[1],rectangle[2]-rectangle[0],rectangle[3]-rectangle[1]);ctx.strokeRect(rectangle[0],rectangle[1],rectangle[2]-rectangle[0],rectangle[3]-rectangle[1]);}
   $('viewHint').textContent = boxMode ? '连续拖动追加选区 · Alt 拖动旋转 · Shift 拖动平移 · Esc 退出框选' : `拖动旋转 · 滚轮缩放 · Shift 拖动平移 · 预览 ${data.xyz.length.toLocaleString()} 点，选点/测量使用完整点云`;
@@ -195,7 +230,8 @@ canvas.onpointerup = () => {
 };
 canvas.onpointercancel=()=>{drag=null;rectangle=null;draw();};
 canvas.onwheel=e=>{e.preventDefault();if(busy || drag)return;zoom=Math.max(.05,Math.min(30,zoom*Math.exp(-e.deltaY*.001)));draw();};
-function resetView(){yaw=-.35;pitch=isBody() ? .6 : -.4;fitView();}
+function setDefaultView(){const top=pageMode==='review'&&isBody();yaw=top?0:-.35;pitch=top?Math.PI/2:isBody()?.6:-.4;}
+function resetView(){setDefaultView();fitView();}
 canvas.ondblclick=()=>{if(!boxMode)resetView();};$('resetView').onclick=resetView;$('fit').onchange=fitView;
 $('showRemoved').onchange=draw;$('method').onchange=controls;
 document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{
@@ -217,20 +253,53 @@ $('applySelection').onclick=()=>action(()=>edit('apply'));
 for(const op of ['undo','redo'])$(op).onclick=()=>action(()=>edit(op));
 $('restoreAll').onclick=()=>action(()=>edit('reset'));
 $('reloadData').onclick=()=>action(async()=>{geometry=null;profileIndex=0;apply(await api('context',identity),true);if(data.alignment && pageMode==='review'){await loadGeometry();}message('已重新载入已暂存的清理版本。');});
-async function openImage() {
-  sourceKind=pageMode==='review' && geometry ? 'profile' : 'candidate';
-  const [response,points]=await Promise.all([fetch(data.image_url),api('image_points',base({kind:sourceKind,profile_index:profileIndex}))]);
-  if(!response.ok){const error=await response.json();throw Error(error.error||'定位底图不可用');}
-  const blob=await response.blob(),url=URL.createObjectURL(blob),im=new Image();
-  try{await new Promise((resolve,reject)=>{im.onload=resolve;im.onerror=()=>reject(Error('定位底图无法显示'));im.src=url;});
-    const c=$('imageCanvas'),g=c.getContext('2d');c.width=im.naturalWidth;c.height=im.naturalHeight;g.drawImage(im,0,0);
-    const [height,width]=points.shape_hw,sx=c.width/width,sy=c.height/height;
-    g.fillStyle=sourceKind==='candidate'?'#db4236':'#e59623';for(const [u,v] of points.uv)g.fillRect(u*sx-1,v*sy-1,2.5,2.5);
-    $('imageHint').textContent=`绿色为${data.report.reviewed?'已确认掩码':'生成所用掩码（未审核）'}；${sourceKind==='candidate'?'红色为选中点':'橙色为当前局部法向剖面'}，共 ${points.count.toLocaleString()} 点。底图使用分割对应的图像坐标。`;
-    $('imageDialog').showModal();
-  }finally{URL.revokeObjectURL(url);}
+async function readImage(path) {
+  const response = await fetch(path);
+  if (!response.ok) {
+    const error = await response.json();
+    throw Error(error.error || '定位底图不可用');
+  }
+  const url = URL.createObjectURL(await response.blob()), image = new Image();
+  try {
+    image.src = url;
+    await image.decode();
+    return image;
+  } finally { URL.revokeObjectURL(url); }
 }
-$('sourceImage').onclick=()=>action(openImage);$('closeImage').onclick=()=>$('imageDialog').close();
+function drawDialogImage(image) {
+  const target = $('imageCanvas'), painter = target.getContext('2d');
+  target.width = image.naturalWidth;
+  target.height = image.naturalHeight;
+  painter.drawImage(image,0,0);
+  return painter;
+}
+async function openImage() {
+  sourceKind = pageMode === 'review' && geometry ? 'profile' : 'candidate';
+  const [image, points] = await Promise.all([
+    readImage(data.image_url), api('image_points', base({kind:sourceKind, profile_index:profileIndex}))
+  ]);
+  const g = drawDialogImage(image);
+  const [height,width] = points.shape_hw, sx = image.naturalWidth/width, sy = image.naturalHeight/height;
+  g.fillStyle = sourceKind === 'candidate' ? '#db4236' : '#e59623';
+  for (const [u,v] of points.uv) g.fillRect(u*sx-1,v*sy-1,2.5,2.5);
+  $('imageTitle').textContent = '分割底图上的位置';
+  $('imageHint').textContent = `绿色为${data.report.reviewed?'已确认掩码':'生成所用掩码（未审核）'}。${sourceKind==='candidate'?'红色为选中点':'橙色为当前局部法向剖面'}，共 ${points.count.toLocaleString()} 点。`;
+  $('imageDialog').showModal();
+}
+async function openAlignmentMarks() {
+  const params = new URLSearchParams({...identity, file:'alignment_check.png', alignment_revision:data.alignment_revision});
+  const image = await readImage('/api/media?' + params);
+  drawDialogImage(image);
+  const {annotations} = data.alignment;
+  const tailHeight = cameraToBody(annotations.tail.xyz_camera_mm)[2];
+  const neckHeight = cameraToBody(annotations.neck.xyz_camera_mm)[2];
+  $('imageTitle').textContent = '本次确认的对齐标注';
+  $('imageHint').textContent = `橙色 Tail 是尾根，紫色 Neck 是颈根，黄框是圈定的地面，绿点参与地面拟合。尾根距地 ${fmt(tailHeight)} mm，颈根距地 ${fmt(neckHeight)} mm。`;
+  $('imageDialog').showModal();
+}
+$('sourceImage').onclick = () => action(openImage);
+$('alignmentMarks').onclick = () => action(openAlignmentMarks);
+$('closeImage').onclick = () => $('imageDialog').close();
 window.addEventListener('resize',()=>{draw();drawGeometryPlots();});
 function inProfile(p,r) {
   const dx=p[0]-r.center_x_mm,dy=p[1]-r.center_y_mm;
@@ -239,7 +308,15 @@ function inProfile(p,r) {
 }
 async function loadGeometry(extra={}) {
   if(offline || !data.alignment)return;
-  const response=await api('features',base({profile_index:profileIndex,...extra}));
+  const reference = data.alignment.reference_id;
+  const response = await api('features', base({profile_index:profileIndex, ...extra, alignment_reference_id:reference}));
+  if (reference && response.features.provenance?.reference_id !== reference) {
+    geometry = null;
+    $('geometrySummary').replaceChildren();
+    $('profileInfo').textContent = '';
+    draw();drawGeometryPlots();
+    throw Error('测量结果与画面所用的坐标不同，请点击“重新载入”');
+  }
   data.revision=response.revision;
   showGeometry(response);
   return response;
@@ -259,7 +336,8 @@ function showGeometry(response) {
   if(!profileRange || previousCount!==config.count)setProfileRange(0,config.count-1);
   const box=$('geometrySummary');box.replaceChildren();
   const progress=document.createElement('p');progress.className='geometry-progress';
-  progress.textContent=`可算 ${geometry.quality.computable_profiles}/${config.count} 片 · 边界已确认 ${geometry.quality.reviewed_profiles}/${config.count} 片 · 横剖面弧长可算 ${geometry.quality.computable_transverse_arcs ?? '—'} 片`;
+  const usable=geometry.profiles.filter(row=>row.status==='usable').length,unusable=geometry.profiles.filter(row=>row.status==='unusable').length;
+  progress.textContent=`可算 ${geometry.quality.computable_profiles}/${config.count} 片 · 已确认可测 ${usable}/${config.count} 片 · 淘汰 ${unusable} 片 · 待定 ${config.count-usable-unusable} 片 · 横剖面弧长可算 ${geometry.quality.computable_transverse_arcs ?? '—'} 片`;
   box.append(progress);
   const labels={endpoint_ground_chord_mm:'端点投影距离',visible_centerline_arc_mm:'可见中心线弧长',centerline_arc_chord_ratio:'弯曲比（弧/弦）',
     profile_width_median_mm:'剖面宽度中位数',profile_width_max_mm:'剖面宽度最大值',profile_width_p90_mm:'剖面宽度 P90',
@@ -283,12 +361,12 @@ function showGeometry(response) {
   controls();drawGeometryPlots();draw();
 }
 function drawGeometryPlots() {
-  if(!geometry)return;
   for(const id of ['profileTrend','profilePlot']) {
     const c=$(id),w=c.clientWidth,h=c.clientHeight,d=devicePixelRatio||1;
     if(!w||!h)continue;
     c.width=w*d;c.height=h*d;const g=c.getContext('2d');g.setTransform(d,0,0,d,0,0);
     g.fillStyle='#f4f6f9';g.fillRect(0,0,w,h);g.font='10px system-ui';g.fillStyle='#68798b';
+    if(!geometry)continue;
     if(id==='profileTrend') {
       const key=$('trendChannel').value,points=geometry.profiles.map(r=>r[key]),valid=points.filter(v=>v!=null);
       g.fillText('尾根 0% → 颈躯连接 100%（按拟合弧长）',8,h-6);
@@ -326,7 +404,7 @@ function trendProfileIndex(x) {
 }
 function setProfileRange(first,last) {
   profileRange=[first,last];$('profileRangeStart').value=first+1;$('profileRangeEnd').value=last+1;
-  $('profileRangeHint').textContent=`已选择第 ${first+1}–${last+1} 片，共 ${last-first+1} 片；可拖动序列曲线或输入编号选区。`;
+  $('profileRangeHint').textContent=`已选择第 ${first+1}–${last+1} 片，共 ${last-first+1} 片；“确认所选”仅确认此范围。`;
   controls();drawGeometryPlots();
 }
 function readProfileRange() {
@@ -368,23 +446,25 @@ for(const [status,id] of Object.entries({usable:'batchProfileUsable',unusable:'b
   if(!profileRange)throw Error('请先选择有效的剖面范围。');
   const [first,last]=profileRange,response=await loadGeometry({profile_range:[first,last],status}),update=response.review_update;
   notify('saved');message(`第 ${first+1}–${last+1} 片：已${({usable:'确认可测',unusable:'淘汰',pending:'恢复待定'})[status]} ${update.updated} 片。`+
-    (update.skipped.length?` 跳过 ${update.skipped.length} 片（点数或中心线支撑不足），保留原状态。`:''));
+    (update.skipped.length?` 跳过 ${update.skipped.length} 片（点数或中心线支撑不足），保留原状态。`:'')+
+    (status==='usable'?' 其余待定未改动；顶部测量筛选“保留”时会自动淘汰。':''));
 });
 async function start() {
   configureMode();
   if(offline){
     data={...OFFLINE_DATA,candidate_count:0};$('coordinate').value=data.offline_body?'body':'camera';
+    $('profileFinalizationHint').hidden=true;
     $('sourceImage').hidden=true;$('offlineFiles').hidden=false;
     $('geometryExportHint').textContent='已随点云成果保存，文件链接见下方';
     $('bodyFile').hidden=!data.alignment;$('sequenceFiles').hidden=!data.features;
-    apply(data,true);pitch=data.offline_body ? .6 : -.4;draw();
+    setDefaultView();apply(data,true);draw();
     if(data.features)showGeometry({features:data.features,profile_index:0});
     message('只读清理成果；剖面数值来自完整点云。原始点云、清理后点云和操作历史分别保存。');return;
   }
   await action(async()=>{
     const response=await api('context',identity);
     $('coordinate').value=pageMode === 'review' && response.alignment ? 'body' : 'camera';
-    pitch=response.alignment && pageMode === 'review' ? .6 : -.4;
+    setDefaultView();
     apply(response,true);
     if(pageMode === 'review' && response.alignment){await loadGeometry();}
     message(pageMode === 'review' ? (response.alignment ? '已载入对齐点云；可按区域或逐片复核左右边界。' : '尚未完成坐标对齐，请先回到“坐标对齐”确认地面、尾根和颈根。') : '已载入完整点云；先检测或框选，再确认删除。');

@@ -47,7 +47,7 @@ body[data-mode=review] .summary{display:grid;grid-template-columns:auto 1fr;colu
 body[data-mode=review] .summary h2{margin:0}
 body[data-mode=review] #counts{font-size:13px;text-align:right}
 body[data-mode=review] .summary p{grid-column:1/-1;margin:0;line-height:1.4}
-body[data-mode=review] #alignmentHint{display:none}
+body[data-mode=review] #alignmentHint:empty{display:none}
 body[data-mode=review] summary{padding:8px 0}
 body[data-mode=review] #geometrySection>.sectionbody{padding:6px 0;gap:0}
 #geometryControls{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}

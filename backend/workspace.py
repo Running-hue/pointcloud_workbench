@@ -84,10 +84,15 @@ def measurement_state(result):
     if (summary.get('measurement_method') != MEASUREMENT_METHOD
             or summary.get('feature_version') != feature_math.VERSION):
         summary = {}
+    total = (summary.get('slice_count') or
+        feature_math.settings(m.get('feature_settings'))['count']) if result.get('has_alignment') else 0
+    usable = summary.get('usable_slices', 0) if total else 0
+    unusable = summary.get('unusable_slices', 0) if total else 0
     return {'measurement_ready': summary.get('measurement_ready') is True,
-            'measurement_usable_slices': summary.get('usable_slices', 0),
-            'measurement_slice_count': (summary.get('slice_count') or
-                feature_math.settings(m.get('feature_settings'))['count']) if result.get('has_alignment') else 0}
+            'measurement_usable_slices': usable,
+            'measurement_unusable_slices': unusable,
+            'measurement_pending_slices': max(0, total-usable-unusable),
+            'measurement_slice_count': total}
 
 
 def write_current_cloud(folder, result, decision):
@@ -97,6 +102,9 @@ def write_current_cloud(folder, result, decision):
         if summary.get('measurement_method') == MEASUREMENT_METHOD:
             current.update(measurement_ready=summary.get('measurement_ready') is True,
                 measurement_usable_slices=summary.get('usable_slices', 0),
+                measurement_unusable_slices=summary.get('unusable_slices', 0),
+                measurement_pending_slices=max(0, summary.get('slice_count', 0)
+                    - summary.get('usable_slices', 0) - summary.get('unusable_slices', 0)),
                 measurement_slice_count=summary.get('slice_count', 0))
     if not all((folder/current[k]).is_file() for k in ('current_ply', 'current_npz')):
         raise ValueError('当前处理版本的主点云文件缺失，未导出本采集')
@@ -408,13 +416,22 @@ class Workspace:
                     raise ValueError('请先完成本阶段处理，再标记保留')
                 if 'stage_version' in payload and payload['stage_version'] != status['version']:
                     raise ValueError('本阶段数据已变化，请刷新后重新确认')
+            finalization = None
+            if stage == 'review' and decision == 'keep':
+                count = self.processing.finalize_review(row, result)
+                finalization = {'auto_rejected_profiles': count}
+                if count:
+                    return {**self.state(), 'measurement_finalization': finalization}
             record = cloud_review_record(result, row['relative_dir'], decision, stage)
             settings = copy.deepcopy(self.settings)
             settings.setdefault('cloud_reviews', {}).setdefault(str(self.results_root), {})[row['relative_dir']] = record
             atomic_json(self.state_dir/'settings.json', settings)
             self.settings = settings
             result['cloud_review'] = record
-            return self.state()
+            response = self.state()
+            if finalization is not None:
+                response['measurement_finalization'] = finalization
+            return response
 
     def state(self):
         from .native_picker import supported
@@ -664,12 +681,14 @@ class Workspace:
         if not row: raise ValueError('找不到采集，请重新载入目录')
         return row
 
-    def media(self, frame_id, filename):
+    def media(self, frame_id, filename, alignment_revision=None):
         if filename not in RESULT_FILES: raise ValueError('不支持的成果文件')
         with self.lock:
             row = self.row(frame_id)
             result = self.results.get(row['relative_dir'])
             if not result: raise ValueError('该采集尚未生成点云')
+            if alignment_revision is not None and alignment_revision != result.get('alignment_revision'):
+                raise ValueError('对齐标注已更新，请点击“重新载入”后查看')
             p = result['folder']/filename
             if p.is_symlink() or p.resolve().parent != result['folder'].resolve():
                 raise ValueError('成果路径不合法')
