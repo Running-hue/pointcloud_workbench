@@ -3,8 +3,10 @@ import io
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from unittest.mock import patch, Mock
 from urllib.request import Request, urlopen
@@ -544,35 +546,28 @@ class NativePickerTest(unittest.TestCase):
             with patch.object(native_picker.sys,'platform','darwin'), patch.object(native_picker.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'\n','')):
                 self.assertTrue(native_picker.choose_directory(root)['cancelled'])
 
-    @unittest.skipUnless(__import__('os').name == 'nt', 'Windows shell bindings')
-    def test_windows_shell_unicode_cancel_and_native_resource_cleanup(self):
-        import ctypes
-        for mode in ('selected', 'cancelled', 'invalid'):
-            shell, ole, user = Mock(), Mock(), Mock()
-            ole.CoInitializeEx.return_value = 0
-            ready = Mock()
-            def browse(info_ptr):
-                info_ptr._obj.lpfn(123, 1, 0, 0)
-                ready.assert_called_once()
-                return None if mode == 'cancelled' else 456
-            shell.SHBrowseForFolderW.side_effect = browse
-            def selected(item, buffer, length, flags):
-                buffer.value = r'C:\点云数据\采集 01'
-                return mode != 'invalid'
-            shell.SHGetPathFromIDListEx.side_effect = selected
-            libraries = {'shell32': shell, 'ole32': ole, 'user32': user}
-            with self.subTest(mode=mode), patch.object(ctypes, 'WinDLL', side_effect=lambda name, **kw: libraries[name]):
-                if mode == 'invalid':
-                    with self.assertRaisesRegex(ValueError, '请选择'):
-                        native_picker.windows_folder('选择原始目录', str(Path.home()), ready)
-                else:
-                    result = native_picker.windows_folder('选择原始目录', str(Path.home()), ready)
-                    self.assertEqual(result, None if mode == 'cancelled' else r'C:\点云数据\采集 01')
-            ole.CoUninitialize.assert_called_once()
-            if mode == 'cancelled':
-                ole.CoTaskMemFree.assert_not_called()
-            else:
-                ole.CoTaskMemFree.assert_called_once_with(456)
+    @unittest.skipUnless(__import__('os').name == 'nt', 'Windows folder dialog')
+    def test_windows_folder_uses_modern_tk_dialog_and_cleans_up(self):
+        root = Mock()
+        tkinter = types.SimpleNamespace(
+            Tk=Mock(return_value=root),
+            filedialog=types.SimpleNamespace(askdirectory=Mock(return_value=r'C:\点云数据\采集 01')),
+        )
+        ready = Mock()
+        with patch.dict(sys.modules, {'tkinter': tkinter}):
+            result = native_picker.windows_folder('选择原始目录', str(Path.home()), ready)
+        self.assertEqual(result, r'C:\点云数据\采集 01')
+        tkinter.Tk.assert_called_once_with()
+        root.withdraw.assert_called_once_with()
+        root.attributes.assert_called_once_with('-topmost', True)
+        ready.assert_called_once_with()
+        tkinter.filedialog.askdirectory.assert_called_once_with(
+            parent=root, title='选择原始目录', initialdir=str(Path.home()), mustexist=True)
+        root.destroy.assert_called_once_with()
+
+        tkinter.filedialog.askdirectory.return_value = ''
+        with patch.dict(sys.modules, {'tkinter': tkinter}):
+            self.assertIsNone(native_picker.windows_folder('选择原始目录', str(Path.home())))
 
     def test_foreign_initial_path_uses_home(self):
         foreign = '/Users/mac-user/Documents/data' if __import__('os').name == 'nt' else r'C:\Users\windows-user\data'

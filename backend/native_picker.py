@@ -107,66 +107,19 @@ def choose_directory(value=None, title='选择文件夹'):
 
 
 def windows_folder(title, initial, on_ready=None):
-    """Open the Windows shell folder picker on the helper's main GUI thread."""
-    import ctypes as c
-    from ctypes import wintypes as w
+    """Open the same modern Windows folder dialog used by the filter project."""
+    from tkinter import Tk, filedialog
 
-    shell = c.WinDLL('shell32', use_last_error=True)
-    ole = c.WinDLL('ole32', use_last_error=True)
-    user = c.WinDLL('user32', use_last_error=True)
-    callback_type = c.WINFUNCTYPE(c.c_int, w.HWND, w.UINT, w.LPARAM, w.LPARAM)
-
-    class BROWSEINFO(c.Structure):
-        _fields_ = [('hwndOwner', w.HWND), ('pidlRoot', c.c_void_p),
-                    ('pszDisplayName', w.LPWSTR), ('lpszTitle', w.LPCWSTR),
-                    ('ulFlags', w.UINT), ('lpfn', callback_type),
-                    ('lParam', w.LPARAM), ('iImage', c.c_int)]
-
-    shell.SHBrowseForFolderW.argtypes = [c.POINTER(BROWSEINFO)]
-    shell.SHBrowseForFolderW.restype = c.c_void_p
-    shell.SHGetPathFromIDListEx.argtypes = [c.c_void_p, w.LPWSTR, w.DWORD, w.DWORD]
-    shell.SHGetPathFromIDListEx.restype = w.BOOL
-    ole.CoInitializeEx.argtypes = [c.c_void_p, w.DWORD]
-    ole.CoInitializeEx.restype = c.c_long
-    ole.CoTaskMemFree.argtypes = [c.c_void_p]
-    ole.CoTaskMemFree.restype = None
-    user.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
-    user.SendMessageW.restype = w.LPARAM
-    user.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
-    user.SetForegroundWindow.argtypes = [w.HWND]
-    user.SetWindowPos.argtypes = [w.HWND, w.HWND, c.c_int, c.c_int, c.c_int, c.c_int, w.UINT]
-    start = c.create_unicode_buffer(initial)
-
-    @callback_type
-    def initialized(hwnd, message, param, data):
-        if message == 1:  # BFFM_INITIALIZED: the dialog really exists now.
-            user.SetWindowTextW(hwnd, title)
-            if on_ready:
-                on_ready()
-            user.SendMessageW(hwnd, 0x467, 1, c.cast(start, c.c_void_p).value)
-            user.SetWindowPos(hwnd, w.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
-            user.SetForegroundWindow(hwnd)
-        return 0
-
-    status = ole.CoInitializeEx(None, 2)
-    if status < 0:
-        raise OSError(f'Windows 目录窗口初始化失败：0x{status & 0xffffffff:08x}')
-    item = None
+    root = Tk()
+    root.withdraw()
     try:
-        display = c.create_unicode_buffer(260)
-        info = BROWSEINFO(None, None, c.cast(display, w.LPWSTR), title, 0x0001 | 0x0010 | 0x0040,
-                          initialized, 0, 0)
-        item = shell.SHBrowseForFolderW(c.byref(info))
-        if not item:
-            return None
-        selected = c.create_unicode_buffer(32768)
-        if not shell.SHGetPathFromIDListEx(item, selected, len(selected), 0):
-            raise ValueError('请选择本机或网络上的文件夹')
-        return selected.value
+        root.attributes('-topmost', True)
+        if on_ready:
+            on_ready()
+        selected = filedialog.askdirectory(parent=root, title=title, initialdir=initial, mustexist=True)
+        return selected or None
     finally:
-        if item:
-            ole.CoTaskMemFree(item)
-        ole.CoUninitialize()
+        root.destroy()
 
 
 if __name__ == '__main__' and len(sys.argv) == 4 and sys.argv[1] == '--windows-helper':
