@@ -121,23 +121,64 @@ def capture_root(folder, relative):
     return folder
 
 
-def relocated_source_roots(results_root, hints):
-    """Probe matching path suffixes beside moved results, without a disk scan."""
-    containers = [Path(results_root).resolve().parent]
-    containers.append(containers[0].parent)
+def portable_path(value):
+    """Read stored paths in their original OS syntax, independently of this host."""
+    text = str(value)
+    return PureWindowsPath(text) if '\\' in text or PureWindowsPath(text).drive else PurePosixPath(text)
+
+
+def local_source_path(value):
+    if not value:
+        return None
+    try:
+        path = Path(value).expanduser()
+        if portable_path(value).is_absolute() and not path.is_absolute():
+            return None
+        return path.resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def source_suffix_roots(containers, hints):
+    """Try exact historical suffixes under known containers; never scan a tree."""
     seen = set()
-    for hint in hints:
-        if not hint:
-            continue
-        text = str(hint)
-        portable = PureWindowsPath(text) if '\\' in text or PureWindowsPath(text).drive else PurePosixPath(text)
+    for hint in dict.fromkeys(str(h) for h in hints if h):
+        portable = portable_path(hint)
         parts = portable.parts[1:] if portable.anchor else portable.parts
+        if '..' in parts or any('\x00' in part for part in parts):
+            continue
         for count in range(len(parts), 0, -1):
             for container in containers:
                 root = container.joinpath(*parts[-count:])
                 if root not in seen:
                     seen.add(root)
                     yield root
+
+
+def relocated_source_roots(results_root, hints):
+    """Support deeper export layouts without searching an entire disk or share."""
+    containers = []
+    for parent in Path(results_root).resolve().parents:
+        if parent == parent.parent or len(containers) == 6:
+            break
+        containers.append(parent)
+    yield from source_suffix_roots(containers, hints)
+
+
+def source_capture_paths(root, relative):
+    """Accept a dataset, camera, pig, or capture directory selected by the user."""
+    try:
+        if not root.is_dir():
+            return
+    except (OSError, ValueError):
+        return
+    parts = Path(relative).parts
+    for offset in range(len(parts)):
+        try:
+            yield within(root, Path(*parts[offset:]))
+        except (OSError, ValueError, RuntimeError):
+            continue
+    yield root
 
 
 def fit_ground(points, threshold_mm=10.):
@@ -271,34 +312,62 @@ class AlignmentService:
         return row, result
 
     def _raw(self, payload, row, report):
-        roots = [payload.get('source_root')] if payload.get('source_root') else [
-            self.ws.settings.get('alignment_sources', {}).get(str(self.ws.results_root)),
-            self.ws.source, self.ws.settings.get('source')]
-        candidates = [within(Path(root).expanduser().resolve(), row['relative_dir']) for root in roots if root]
-        if not payload.get('source_root') and report.get('source_dir'):
-            candidates.append(Path(report['source_dir']).expanduser().resolve())
-        if not payload.get('source_root'):
-            hints = list(roots)
-            text = report.get('source_dir', '')
-            portable = PureWindowsPath(text) if '\\' in text or PureWindowsPath(text).drive else PurePosixPath(text)
+        explicit = payload.get('source_root')
+        sources = self.ws.settings.get('alignment_sources', {})
+        known_roots = [sources.get(str(self.ws.results_root)), self.ws.source,
+                       self.ws.settings.get('source'),
+                       *self.ws.settings.get('alignment_source_roots', []), *sources.values()]
+        hints = list(known_roots)
+        source_hint = report.get('source_dir', '')
+        if source_hint:
+            portable = portable_path(source_hint)
             relative = Path(row['relative_dir']).parts
-            if portable.parts[-len(relative):] == relative:
-                hints.append(str(portable.parents[len(relative)-1]))
-            candidates.extend(within(root, row['relative_dir'])
-                              for root in relocated_source_roots(self.ws.results_root, hints))
+            matched = 0
+            for left, right in zip(reversed(portable.parts), reversed(relative)):
+                if left != right:
+                    break
+                matched += 1
+            if matched:
+                hints.append(str(portable.parents[matched-1]))
+
+        def candidates():
+            # Explicit choices stay inside the selected directory. A wrong choice
+            # must not silently fall back to another batch's saved source root.
+            roots = [explicit] if explicit else known_roots
+            for value in dict.fromkeys(str(root) for root in roots if root):
+                root = local_source_path(value)
+                if root is not None:
+                    yield from source_capture_paths(root, row['relative_dir'])
+            if explicit:
+                root = local_source_path(explicit)
+                relocated = source_suffix_roots([root], hints) if root is not None else ()
+            else:
+                direct = local_source_path(source_hint)
+                if direct is not None:
+                    yield direct
+                relocated = relocated_source_roots(self.ws.results_root, hints)
+            for root in relocated:
+                yield from source_capture_paths(root, row['relative_dir'])
+
         checked = set()
-        for source in candidates:
+        for source in candidates():
             if source in checked:
                 continue
             checked.add(source)
-            if all((source/n).is_file() and not (source/n).is_symlink() for n in RAW_FILES):
+            try:
+                if not all((source/n).is_file() and not (source/n).is_symlink() for n in RAW_FILES):
+                    continue
                 hashes = {n: sha256(source/n) for n in RAW_FILES}
-                expected = report.get('source_sha256', {})
-                if any(n not in expected for n in RAW_FILES):
-                    raise ValueError('该成果缺少原始深度校验值，请重新生成点云后再建立测量坐标')
-                if all(hashes[n] == expected[n] for n in RAW_FILES):
-                    return source, hashes
-        raise ValueError('找不到与当前点云匹配的原始深度；请选择原始采集根目录（保留相对目录层级）')
+            except (OSError, ValueError):
+                # Stale network drives, inaccessible old directories and invalid
+                # foreign paths must not hide a usable, verified new location.
+                continue
+            expected = report.get('source_sha256', {})
+            if any(n not in expected for n in RAW_FILES):
+                raise ValueError('该成果缺少原始深度校验值，请重新生成点云后再建立测量坐标')
+            if all(hashes[n] == expected[n] for n in RAW_FILES):
+                return source, hashes
+        raise ValueError('找不到与当前点云匹配的原始深度；请选择原始采集目录（可选数据根目录、相机目录、猪编号目录或当前采集目录）')
 
     def context(self, payload):
         with self.ws.lock:
@@ -392,8 +461,12 @@ class AlignmentService:
                 self.contexts.pop(next(iter(self.contexts)))
             source_root = str(ctx['source_root'])
             sources = self.ws.settings.setdefault('alignment_sources', {})
-            if sources.get(str(self.ws.results_root)) != source_root:
+            roots = [source_root, *[root for root in self.ws.settings.get('alignment_source_roots', [])
+                                    if root != source_root]][:64]
+            if (sources.get(str(self.ws.results_root)) != source_root
+                    or roots != self.ws.settings.get('alignment_source_roots')):
                 sources[str(self.ws.results_root)] = source_root
+                self.ws.settings['alignment_source_roots'] = roots
                 self.ws.remember()
             return {'context_id': token, 'width': w, 'height': h, 'source_dir': str(source),
                     'source_root': source_root,

@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -592,6 +593,209 @@ class AlignmentWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '匹配'):
             self.ws.alignment.context(self.base)
         self.assertNotIn(str(self.ws.results_root), self.ws.settings.get('alignment_sources', {}))
+
+    def test_renamed_results_reuse_another_results_verified_raw_root(self):
+        raw = self.root/'renamed-inputs'/'batch-alpha'
+        raw.parent.mkdir(parents=True)
+        shutil.move(self.raw, raw)
+        self.source = raw/self.rel
+        # Establish this mapping by validation, rather than inventing a cache entry.
+        verified = self.ws.alignment.context({**self.base, 'source_root': str(raw)})
+        self.assertEqual(verified['source_dir'], str(self.source.resolve()))
+        old_results = str(self.results)
+        self.assertEqual(self.ws.settings['alignment_sources'][old_results], str(raw.resolve()))
+        self.ws.settings.pop('alignment_source_roots', None)
+        results = self.root/'independent-export'/'a'/'b'/'c'/'renamed-clouds'
+        results.parent.mkdir(parents=True)
+        shutil.move(self.results, results)
+        self.folder = results/self.rel
+        report = read_json(self.folder/'pointcloud.json')
+        report['source_dir'] = '/obsolete/mac/old-raw/'+self.rel
+        write_json(self.folder/'pointcloud.json', report)
+        self.ws.source = None
+        self.ws.settings.pop('source', None)
+        self.ws.open_results(str(results), remember=False)
+        base = {'dataset_id': self.ws.dataset_id, 'id': self.ws.state()['frames'][0]['id']}
+        before = {p.name: sha256(p) for p in self.folder.iterdir() if p.is_file()}
+        context = self.ws.alignment.context(base)
+        self.assertEqual(context['source_dir'], str(self.source.resolve()))
+        self.assertEqual(context['source_root'], str(raw.resolve()))
+        self.assertEqual(self.ws.settings['alignment_sources'][str(results)], str(raw.resolve()))
+        self.assertEqual(before, {p.name: sha256(p) for p in self.folder.iterdir() if p.is_file()})
+
+    def test_verified_raw_root_survives_reopen_without_result_path_mapping(self):
+        raw, results = self.moved_inputs(mac_only=True)
+        context = self.ws.alignment.context({**self.base, 'source_root': str(raw)})
+        self.assertEqual(context['source_dir'], str(self.source.resolve()))
+        self.assertIn(str(raw.resolve()), self.ws.settings['alignment_source_roots'])
+        report = read_json(self.folder/'pointcloud.json')
+        report['source_dir'] = '/obsolete/history/unrelated-batch/'+self.rel
+        write_json(self.folder/'pointcloud.json', report)
+        self.ws.settings.pop('alignment_sources', None)
+        self.ws.settings.pop('source', None)
+        self.ws.source = None
+        self.ws.remember()
+        reopened = Workspace(self.ws.state_dir, initial_results=results)
+        self.assertFalse(reopened.settings.get('alignment_sources'))
+        self.assertIsNone(reopened.source)
+        again = reopened.alignment.context({'dataset_id': reopened.dataset_id,
+                                           'id': reopened.state()['frames'][0]['id']})
+        self.assertEqual(again['source_dir'], str(self.source.resolve()))
+        self.assertEqual(again['source_root'], str(raw.resolve()))
+        self.assertEqual(reopened.settings['alignment_sources'][str(results)], str(raw.resolve()))
+
+    def test_root_history_keeps_previous_batch_when_same_result_mapping_is_overwritten(self):
+        raw, results = self.moved_inputs(mac_only=True)
+        self.ws.alignment.context({**self.base, 'source_root': str(raw)})
+        original_report = read_json(self.folder/'pointcloud.json')
+        other_raw = self.root/'separate-batch'/'renamed-raw'
+        other_source = other_raw/self.rel
+        shutil.copytree(self.source, other_source)
+        record = read_json(other_source/'reconstruction.json')
+        record['batch'] = 'different-inputs'
+        write_json(other_source/'reconstruction.json', record)
+        other_report = deepcopy(original_report)
+        other_report['source_sha256'] = {name: sha256(other_source/name)
+                                         for name in original_report['source_sha256']}
+        write_json(self.folder/'pointcloud.json', other_report)
+        other_context = self.ws.alignment.context({**self.base, 'source_root': str(other_raw)})
+        self.assertEqual(other_context['source_dir'], str(other_source.resolve()))
+        self.assertEqual(self.ws.settings['alignment_sources'][str(results)], str(other_raw.resolve()))
+        self.assertEqual(self.ws.settings['alignment_source_roots'][:2],
+                         [str(other_raw.resolve()), str(raw.resolve())])
+        # Restore batch A's report while leaving the per-result mapping on batch B.
+        original_report['source_dir'] = '/obsolete/history/unrelated-batch/'+self.rel
+        write_json(self.folder/'pointcloud.json', original_report)
+        self.ws.settings.pop('source', None)
+        self.ws.source = None
+        self.ws.remember()
+        reopened = Workspace(self.ws.state_dir, initial_results=results)
+        again = reopened.alignment.context({'dataset_id': reopened.dataset_id,
+                                           'id': reopened.state()['frames'][0]['id']})
+        self.assertEqual(again['source_dir'], str(self.source.resolve()))
+        self.assertEqual(reopened.settings['alignment_source_roots'][:2],
+                         [str(raw.resolve()), str(other_raw.resolve())])
+        self.assertEqual(reopened.settings['alignment_source_roots'].count(str(raw.resolve())), 1)
+
+    def test_deep_results_find_sibling_raw_from_historical_path_suffix(self):
+        raw, results = self.moved_inputs(mac_only=True)
+        for depth in (3, 4, 5):
+            with self.subTest(result_ancestor_depth=depth):
+                target = raw.parents[2]/('exports-'+str(depth))
+                for level in range(depth-2):
+                    target /= 'nested-'+str(level)
+                target /= 'clouds-renamed'
+                target.parent.mkdir(parents=True)
+                shutil.move(results, target)
+                results = target
+                self.ws.settings.pop('alignment_sources', None)
+                self.ws.settings.pop('alignment_source_roots', None)
+                self.ws.source = None
+                self.ws.settings.pop('source', None)
+                self.ws.open_results(str(results), remember=False)
+                base = {'dataset_id': self.ws.dataset_id, 'id': self.ws.state()['frames'][0]['id']}
+                context = self.ws.alignment.context(base)
+                self.assertEqual(context['source_root'], str(raw.resolve()))
+                self.assertEqual(context['source_dir'], str(self.source.resolve()))
+
+    def test_manual_raw_camera_captures_pig_and_capture_choices_survive_reopen(self):
+        raw, results = self.moved_inputs(mac_only=True)
+        for history in ('/obsolete/mac/selected/'+self.rel,
+                        'Z:\\archive\\selected\\'+self.rel.replace('/', '\\')):
+            report = read_json(self.folder/'pointcloud.json')
+            report['source_dir'] = history
+            write_json(self.folder/'pointcloud.json', report)
+            for suffix in ('', 'camera', 'camera/captures', 'camera/captures/pig_0001', self.rel):
+                with self.subTest(history=history, selected=suffix or 'raw'):
+                    self.ws.settings.pop('alignment_sources', None)
+                    self.ws.settings.pop('source', None)
+                    self.ws.source = None
+                    context = self.ws.alignment.context({**self.base, 'source_root': str(raw/suffix)})
+                    self.assertEqual(context['source_dir'], str(self.source.resolve()))
+                    self.assertEqual(context['source_root'], str(raw.resolve()))
+                    reopened = Workspace(self.ws.state_dir, initial_results=results)
+                    again = reopened.alignment.context({'dataset_id': reopened.dataset_id,
+                                                       'id': reopened.state()['frames'][0]['id']})
+                    self.assertEqual(again['source_dir'], str(self.source.resolve()))
+                    self.assertEqual(again['source_root'], context['source_root'])
+
+    def test_manual_choices_use_original_report_when_results_relative_is_shortened(self):
+        raw, results = self.moved_inputs(mac_only=True)
+        shortened = results/'capture'
+        shutil.move(self.folder, shortened)
+        self.folder = shortened
+        self.ws.open_results(str(results), remember=False)
+        base = {'dataset_id': self.ws.dataset_id, 'id': self.ws.state()['frames'][0]['id']}
+        self.assertEqual(self.ws.state()['frames'][0]['relative_dir'], 'capture')
+        for suffix in ('', 'camera', 'camera/captures', 'camera/captures/pig_0001', self.rel):
+            with self.subTest(selected=suffix or 'raw'):
+                self.ws.settings.pop('alignment_sources', None)
+                context = self.ws.alignment.context({**base, 'source_root': str(raw/suffix)})
+                self.assertEqual(context['source_dir'], str(self.source.resolve()))
+                reopened = Workspace(self.ws.state_dir, initial_results=results)
+                again = reopened.alignment.context({'dataset_id': reopened.dataset_id,
+                                                   'id': reopened.state()['frames'][0]['id']})
+                self.assertEqual(again['source_dir'], str(self.source.resolve()))
+
+    def test_explicit_wrong_directory_cannot_fall_back_to_valid_ancestor_source(self):
+        raw, results = self.moved_inputs(mac_only=True)
+        wrong = self.root/'wrong-empty-source'
+        wrong.mkdir()
+        # The successful automatic probe proves that an ancestor has valid raw data.
+        self.assertEqual(self.ws.alignment.context(self.base)['source_root'], str(raw.resolve()))
+        remembered = deepcopy(self.ws.settings['alignment_sources'])
+        with self.assertRaisesRegex(ValueError, '匹配'):
+            self.ws.alignment.context({**self.base, 'source_root': str(wrong)})
+        self.assertEqual(self.ws.settings['alignment_sources'], remembered)
+        self.assertEqual(self.ws.alignment.context(self.base)['source_dir'], str(self.source.resolve()))
+
+    def test_explicit_same_named_capture_with_different_hash_is_rejected(self):
+        raw, _ = self.moved_inputs(mac_only=True)
+        wrong = self.root/'wrong-hash'
+        impostor = wrong/self.rel
+        shutil.copytree(self.source, impostor)
+        with (impostor/'reconstruction.json').open('a') as stream:
+            stream.write(' ')
+        self.assertNotEqual(sha256(impostor/'reconstruction.json'),
+                            sha256(self.source/'reconstruction.json'))
+        for choice in (wrong, impostor):
+            with self.subTest(selected=choice):
+                with self.assertRaisesRegex(ValueError, '匹配'):
+                    self.ws.alignment.context({**self.base, 'source_root': str(choice)})
+                self.assertNotIn(str(self.ws.results_root), self.ws.settings.get('alignment_sources', {}))
+        self.assertEqual(self.ws.alignment.context(self.base)['source_root'], str(raw.resolve()))
+
+    def test_windows_historical_source_path_reconnects_to_local_temp_raw(self):
+        raw, results = self.moved_inputs(mac_only=True)
+        report = read_json(self.folder/'pointcloud.json')
+        historical = 'Z:/archive/图片筛选/筛选批次/selected/'+self.rel
+        report['source_dir'] = historical.replace('/', chr(92))
+        write_json(self.folder/'pointcloud.json', report)
+        before = sha256(self.folder/'pointcloud.json')
+        context = self.ws.alignment.context(self.base)
+        self.assertEqual(context['source_dir'], str(self.source.resolve()))
+        self.assertEqual(context['source_root'], str(raw.resolve()))
+        self.assertEqual(self.ws.settings['alignment_sources'][str(results)], str(raw.resolve()))
+        for name, digest in report['source_sha256'].items():
+            self.assertEqual(sha256(Path(context['source_dir'])/name), digest)
+        self.assertEqual(sha256(self.folder/'pointcloud.json'), before)
+
+    def test_unreadable_candidate_does_not_hide_a_later_matching_source(self):
+        raw, _ = self.moved_inputs(mac_only=True)
+        unreadable = self.root/'unreadable-source'
+        shutil.copytree(self.source, unreadable/self.rel)
+        self.ws.settings['source'] = str(unreadable)
+        original_sha256 = sha256
+        def deny_candidate(path):
+            if Path(path).parent == unreadable/self.rel:
+                raise PermissionError('simulated unreadable raw input')
+            return original_sha256(path)
+        with patch('pointcloud_workbench.alignment.sha256', side_effect=deny_candidate) as digest:
+            context = self.ws.alignment.context(self.base)
+        self.assertTrue(any(Path(call.args[0]).parent == unreadable/self.rel
+                            for call in digest.call_args_list))
+        self.assertEqual(context['source_dir'], str(self.source.resolve()))
+        self.assertEqual(context['source_root'], str(raw.resolve()))
 
     def test_http_contract_preview_executes_and_saved_body_links_resolve(self):
         server=ThreadingHTTPServer(('127.0.0.1',0),make_handler(self.ws,'token'))
