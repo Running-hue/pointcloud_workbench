@@ -8,7 +8,7 @@ import hashlib
 from html import escape
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import secrets
 import shutil
 import tempfile
@@ -119,6 +119,25 @@ def capture_root(folder, relative):
     for _ in rel.parts:
         folder = folder.parent
     return folder
+
+
+def relocated_source_roots(results_root, hints):
+    """Probe matching path suffixes beside moved results, without a disk scan."""
+    containers = [Path(results_root).resolve().parent]
+    containers.append(containers[0].parent)
+    seen = set()
+    for hint in hints:
+        if not hint:
+            continue
+        text = str(hint)
+        portable = PureWindowsPath(text) if '\\' in text or PureWindowsPath(text).drive else PurePosixPath(text)
+        parts = portable.parts[1:] if portable.anchor else portable.parts
+        for count in range(len(parts), 0, -1):
+            for container in containers:
+                root = container.joinpath(*parts[-count:])
+                if root not in seen:
+                    seen.add(root)
+                    yield root
 
 
 def fit_ground(points, threshold_mm=10.):
@@ -258,7 +277,20 @@ class AlignmentService:
         candidates = [within(Path(root).expanduser().resolve(), row['relative_dir']) for root in roots if root]
         if not payload.get('source_root') and report.get('source_dir'):
             candidates.append(Path(report['source_dir']).expanduser().resolve())
+        if not payload.get('source_root'):
+            hints = list(roots)
+            text = report.get('source_dir', '')
+            portable = PureWindowsPath(text) if '\\' in text or PureWindowsPath(text).drive else PurePosixPath(text)
+            relative = Path(row['relative_dir']).parts
+            if portable.parts[-len(relative):] == relative:
+                hints.append(str(portable.parents[len(relative)-1]))
+            candidates.extend(within(root, row['relative_dir'])
+                              for root in relocated_source_roots(self.ws.results_root, hints))
+        checked = set()
         for source in candidates:
+            if source in checked:
+                continue
+            checked.add(source)
             if all((source/n).is_file() and not (source/n).is_symlink() for n in RAW_FILES):
                 hashes = {n: sha256(source/n) for n in RAW_FILES}
                 expected = report.get('source_sha256', {})
@@ -358,10 +390,13 @@ class AlignmentService:
             self.contexts[token] = ctx
             while len(self.contexts) > 3:
                 self.contexts.pop(next(iter(self.contexts)))
-            if payload.get('source_root'):
-                self.ws.settings.setdefault('alignment_sources', {})[str(self.ws.results_root)] = str(Path(payload['source_root']).expanduser().resolve())
+            source_root = str(ctx['source_root'])
+            sources = self.ws.settings.setdefault('alignment_sources', {})
+            if sources.get(str(self.ws.results_root)) != source_root:
+                sources[str(self.ws.results_root)] = source_root
                 self.ws.remember()
             return {'context_id': token, 'width': w, 'height': h, 'source_dir': str(source),
+                    'source_root': source_root,
                     'draft_binding': digest_json({'raw': hashes, 'cloud': ctx['input_cloud_sha256'], 'report': ctx['input_report_sha256']}),
                     'relative_dir': row['relative_dir'], 'pig_id': row['pig_id'],
                     'capture_id': row['capture_id'],

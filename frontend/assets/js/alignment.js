@@ -43,10 +43,11 @@ function restoreConfirmed(result){
  $('referenceStatus').textContent=result.alignment_cached?'本条已确认 · 待统一导出':'已保存对齐';showQuality(record);
  message(result.alignment_cached?'本条已确认并暂存，可继续下一条，最后在工作台顶部统一导出。':'已恢复本条确认坐标，可直接纳入统一导出，或修改后重新确认。');return true;
 }
-async function load(){
+async function load(useSelectedRoot=true){
  message('正在读取完整场景深度并核对来源…');++loadEpoch;context=null;background=foreground=null;
  zoom=1;panX=panY=0;ctx.clearRect(0,0,canvas.width,canvas.height);displayHint();invalidate();
- const result=await api('alignment/context',{source_root:$('rawRoot').value.trim()});context=result;polygon=[];tail=neck=null;candidate=null;saved=null;$('saved').hidden=true;
+ const result=await api('alignment/context',useSelectedRoot?{source_root:$('rawRoot').value.trim()}:{});context=result;
+ if(result.source_root)$('rawRoot').value=result.source_root;polygon=[];tail=neck=null;candidate=null;saved=null;$('saved').hidden=true;
  document.querySelector('#imageMode option[value="ir"]').textContent=result.infrared_verified?'原始 IR':'原始深度灰度';
  document.querySelector('#imageMode option[value="ir_enhanced"]').textContent=result.infrared_verified?'增强 IR（提亮背景）':'增强深度灰度';
  $('imageMode').value=result.default_display_mode||'ir';
@@ -132,7 +133,7 @@ action(async()=>{
  const response=await fetch('/api/state'),state=await response.json();
  if(state.dataset_id!==base.dataset_id)throw new Error('目录已切换，请返回工作台重新打开坐标对齐');
  draftKey='pointcloud-alignment:'+JSON.stringify([state.results,base.id]);
- $('rawRoot').value=state.alignment_source||state.source||'';await load();
+ $('rawRoot').value=state.alignment_source||state.source||'';await load(false);
 });
 
 for(const [button,dialog] of [['sceneSettings','sourceDialog'],['showHelp','helpDialog'],['checkDetails','checkDialog']])$(button).onclick=()=>$(dialog).showModal();

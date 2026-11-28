@@ -544,6 +544,55 @@ class AlignmentWorkflowTest(unittest.TestCase):
         self.assertEqual(Path(context['source_dir']),self.source.resolve())
         self.assertEqual(self.ws.state()['alignment_source'],str(self.raw))
 
+    def moved_inputs(self, mac_only=False):
+        day = self.root/'11-10'
+        raw = day/'图片筛选'/'筛选批次'/'selected'
+        results = day/'点云成果'/'合并'
+        raw.parent.mkdir(parents=True)
+        results.parent.mkdir(parents=True)
+        shutil.move(self.raw, raw)
+        shutil.move(self.results, results)
+        self.source, self.folder = raw/self.rel, results/self.rel
+        report = read_json(self.folder/'pointcloud.json')
+        hint = '图片筛选/筛选批次/selected' if mac_only else '图片筛选/selected'
+        report['source_dir'] = '/Users/mac/archive/'+hint+'/'+self.rel
+        write_json(self.folder/'pointcloud.json', report)
+        self.ws.source = None
+        self.ws.settings.pop('source', None)
+        self.ws.settings.pop('alignment_sources', None)
+        if not mac_only:
+            self.ws.settings['source'] = str(self.root/'图片筛选'/'筛选批次'/'selected')
+        self.ws.open_results(str(results), remember=False)
+        self.base = {'dataset_id': self.ws.dataset_id, 'id': self.ws.state()['frames'][0]['id']}
+        return raw, results
+
+    def test_moved_windows_paths_reconnect_and_remember_verified_source(self):
+        raw, results = self.moved_inputs()
+        before = {p.name: sha256(p) for p in self.folder.iterdir() if p.is_file()}
+        context = self.ws.alignment.context(self.base)
+        self.assertEqual(Path(context['source_root']), raw.resolve())
+        self.assertEqual(Path(context['source_dir']), self.source.resolve())
+        self.assertEqual(self.ws.settings['alignment_sources'][str(results)], str(raw.resolve()))
+        self.assertEqual(before, {p.name: sha256(p) for p in self.folder.iterdir() if p.is_file()})
+        reopened = Workspace(self.ws.state_dir, initial_results=results)
+        again = reopened.alignment.context({'dataset_id': reopened.dataset_id,
+                                           'id': reopened.state()['frames'][0]['id']})
+        self.assertEqual(again['source_root'], str(raw.resolve()))
+
+    def test_moved_mac_paths_reconnect_without_old_windows_settings(self):
+        raw, _ = self.moved_inputs(mac_only=True)
+        self.assertEqual(self.ws.alignment.context(self.base)['source_root'], str(raw.resolve()))
+
+    def test_relocation_checks_hashes_and_respects_explicit_source_choice(self):
+        self.moved_inputs()
+        with self.assertRaisesRegex(ValueError, '匹配'):
+            self.ws.alignment.context({**self.base, 'source_root': str(self.root/'wrong')})
+        with (self.source/'reconstruction.json').open('a') as f:
+            f.write(' ')
+        with self.assertRaisesRegex(ValueError, '匹配'):
+            self.ws.alignment.context(self.base)
+        self.assertNotIn(str(self.ws.results_root), self.ws.settings.get('alignment_sources', {}))
+
     def test_http_contract_preview_executes_and_saved_body_links_resolve(self):
         server=ThreadingHTTPServer(('127.0.0.1',0),make_handler(self.ws,'token'))
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
